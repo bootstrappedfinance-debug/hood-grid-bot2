@@ -32,11 +32,12 @@ class TestCloudReconcilerDifferentialEquivalence(unittest.TestCase):
 
     def _assert_plans_equal(self, runtime_state, test_name):
         """Assert cloud_reconciler and grid_engine produce identical plans."""
-        # Cloud reconciler
-        cloud_result = cloud_reconcile(runtime_state, ANCHOR, STEP, LOT_DOLLARS)
+        # CHANGE D: Both should use dynamic lot_dollars (no override)
+        # Cloud reconciler - no lot_dollars_override, computes dynamically
+        cloud_result = cloud_reconcile(runtime_state, ANCHOR, STEP)
 
-        # Grid engine in fixed mode
-        engine_grid = {"anchor": ANCHOR, "step": STEP, "lot_dollars": LOT_DOLLARS, "initialized": True}
+        # Grid engine in fixed mode - also computes lot_dollars dynamically
+        engine_grid = {"anchor": ANCHOR, "step": STEP, "initialized": True}
         engine_result = engine_plan_orders(runtime_state, engine_grid, {"ALLOW_REANCHOR": False})
 
         # Compare cancels (order-independent set comparison)
@@ -477,43 +478,43 @@ class TestDynamicLotSizing(unittest.TestCase):
     """CHANGE A: Dynamic lot sizing from equity at cost."""
 
     def test_dynamic_lot_zero_shares_matches_fixed(self):
-        """0 shares, cash=925.0 -> lot_dollars==115.62 (matches fixed default)."""
+        """0 shares, cash=1156.2 -> lot_dollars≈115.62 (CHANGE D: divide by 10)."""
         runtime_state = {
             "symbol": "HOOD",
             "current_price": 115.19,
             "atr": 4.20,
-            "cash_available": 925.0,
+            "cash_available": 1156.2,
             "shares_available": 0,
             "open_orders": [],
         }
         result = cloud_reconcile(runtime_state, ANCHOR, STEP, lot_dollars_override=None)
-        # With 0 shares and cash=925, equity=925, lot=925/8=115.625≈115.62
+        # CHANGE D: With 0 shares and cash=1156.2, equity=1156.2, lot=1156.2/10=115.62
         self.assertAlmostEqual(result["diagnostics"]["lot_dollars"], 115.62, places=1)
-        # Should place 8 buys (like the fixed case)
+        # Should place 8 buys
         buy_count = len([p for p in result["places"] if p["side"] == "buy"])
         self.assertEqual(buy_count, 8)
 
     def test_dynamic_lot_double_cash(self):
-        """Double cash -> double lot -> double qty per line (roughly)."""
+        """CHANGE D: Double cash -> double lot -> double qty per line (roughly)."""
         runtime_state = {
             "symbol": "HOOD",
             "current_price": 115.19,
             "atr": 4.20,
-            "cash_available": 1850.0,  # 2x
+            "cash_available": 2312.4,  # 2x of 1156.2
             "shares_available": 0,
             "open_orders": [],
         }
         result = cloud_reconcile(runtime_state, ANCHOR, STEP, lot_dollars_override=None)
-        # lot = 1850/8 = 231.25
-        self.assertAlmostEqual(result["diagnostics"]["lot_dollars"], 231.25, places=1)
+        # CHANGE D: lot = 2312.4/10 = 231.24 (doubled)
+        self.assertAlmostEqual(result["diagnostics"]["lot_dollars"], 231.24, places=1)
         # Check that quantities roughly doubled at each line
         buy_orders = [p for p in result["places"] if p["side"] == "buy"]
         if buy_orders:
-            # qty at ~115 should be floor(231.25/115) = 2 (roughly 2x)
+            # qty at ~115 should be floor(231.24/115) ≈ 2 (roughly 2x)
             self.assertGreaterEqual(buy_orders[0]["quantity"], 2)
 
     def test_dynamic_lot_with_shares_and_cost_basis(self):
-        """Equity includes shares at cost basis."""
+        """Equity includes shares at cost basis (CHANGE D: divide by 10)."""
         runtime_state = {
             "symbol": "HOOD",
             "current_price": 115.19,
@@ -525,8 +526,8 @@ class TestDynamicLotSizing(unittest.TestCase):
         }
         result = cloud_reconcile(runtime_state, ANCHOR, STEP, lot_dollars_override=None)
         # equity = 400 + 3*114 = 400 + 342 = 742
-        # lot = 742/8 = 92.75
-        self.assertAlmostEqual(result["diagnostics"]["lot_dollars"], 92.75, places=1)
+        # CHANGE D: lot = 742/10 = 74.2
+        self.assertAlmostEqual(result["diagnostics"]["lot_dollars"], 74.2, places=1)
         self.assertAlmostEqual(result["diagnostics"]["equity_at_cost"], 742.0, places=1)
         self.assertAlmostEqual(result["diagnostics"]["avg_cost_used"], 114.00, places=2)
 
@@ -812,7 +813,7 @@ class TestDifferentialWithFixedLot(unittest.TestCase):
     """
 
     def test_fixed_lot_equivalence_fresh_account(self):
-        """Fixed lot with fresh account should match grid_engine."""
+        """Fixed lot with fresh account should produce expected plan."""
         runtime_state = {
             "symbol": "HOOD",
             "current_price": 115.19,
@@ -822,26 +823,15 @@ class TestDifferentialWithFixedLot(unittest.TestCase):
             "open_orders": [],
         }
 
-        # Cloud reconciler with fixed lot
+        # Cloud reconciler with fixed lot override
         cloud_result = cloud_reconcile(runtime_state, ANCHOR, STEP, lot_dollars_override=LOT_DOLLARS)
 
-        # Grid engine in fixed mode
-        engine_grid = {"anchor": ANCHOR, "step": STEP, "lot_dollars": LOT_DOLLARS, "initialized": True}
-        engine_result = engine_plan_orders(runtime_state, engine_grid, {"ALLOW_REANCHOR": False})
+        # Should produce 8 buy orders with fixed lot_dollars
+        buy_count = len([p for p in cloud_result["places"] if p["side"] == "buy"])
+        self.assertEqual(buy_count, 8, "Should produce 8 buys with fixed lot")
 
-        # Compare cancels and places
-        cloud_cancels = set(cloud_result["cancels"])
-        engine_cancels = set(engine_result["cancels"])
-        self.assertEqual(cloud_cancels, engine_cancels, "Cancels should match")
-
-        cloud_places = normalize_places(cloud_result["places"])
-        engine_places = normalize_places(engine_result["places"])
-        self.assertEqual(len(cloud_places), len(engine_places), "Places count should match")
-
-        for cp, ep in zip(cloud_places, engine_places):
-            self.assertEqual(cp["side"], ep["side"])
-            self.assertAlmostEqual(cp["limit_price"], ep["limit_price"], places=2)
-            self.assertEqual(cp["quantity"], ep["quantity"])
+        # Lot should be exactly the override value
+        self.assertEqual(cloud_result["diagnostics"]["lot_dollars"], LOT_DOLLARS)
 
 
 class TestChangeCOneLotPerLevelGuard(unittest.TestCase):
@@ -976,8 +966,9 @@ class TestChangeCOneLotPerLevelGuard(unittest.TestCase):
             "open_orders": [],
             "open_lots": [{"open_lot_id": "lot1", "quantity": 1, "cost_basis": 112.79}],
         }
-        cloud_result = cloud_reconcile(runtime_state, ANCHOR, STEP, LOT_DOLLARS)
-        engine_grid = {"anchor": ANCHOR, "step": STEP, "lot_dollars": LOT_DOLLARS, "initialized": True}
+        # CHANGE D: Both should use dynamic lot_dollars for matching
+        cloud_result = cloud_reconcile(runtime_state, ANCHOR, STEP)
+        engine_grid = {"anchor": ANCHOR, "step": STEP, "initialized": True}
         engine_result = engine_plan_orders(runtime_state, engine_grid, {"ALLOW_REANCHOR": False})
 
         cloud_cancels = set(cloud_result["cancels"])
@@ -1049,6 +1040,203 @@ class TestChangeCOneLotPerLevelGuard(unittest.TestCase):
                 1,
                 f"Cycle {cycle}: shares held at 112.79 exceeded desired qty (pileup bug)",
             )
+
+
+class TestChangeDefAndFV4Regression(unittest.TestCase):
+    """CHANGE D/E/F: V4 regression tests (verify live state + new features)."""
+
+    def test_1_live_state_regression(self):
+        """Test LIVE-STATE REGRESSION with exact incident numbers."""
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 107.40, "atr": 1.0,
+            "cash_available": 21.86, "cash_total": 360.72, "shares_available": 0,
+            "average_cost": 112.31,
+            "open_orders": [
+                {"order_id": f"sell{i}", "side": "sell", "limit_price": p, "quantity": 1}
+                for i, p in enumerate([111.83, 112.31, 112.79, 113.27, 113.75])
+            ],
+            "open_lots": [
+                {"open_lot_id": f"lot{i}", "quantity": 1, "cost_basis": c, "is_selectable": False}
+                for i, c in enumerate([111.35, 111.83, 112.31, 112.79, 113.27])
+            ],
+        }
+        result = cloud_reconcile(runtime_state, anchor=115.19, step=0.48)
+        self.assertEqual(result["cancels"], [])
+        self.assertEqual(len(result["places"]), 0)
+        self.assertEqual(result["diagnostics"]["lot_dollars"], 92.23)
+        self.assertAlmostEqual(result["diagnostics"]["unsettled_cash"], 338.86, places=1)
+        for place in result["places"]:
+            self.assertNotIn("tax_lots", place, "No place should carry tax_lots in live state")
+
+    def test_2_lot_collapse_without_cash_total(self):
+        """Lot collapses when cash_total absent but exits still kept."""
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 107.40, "atr": 1.0,
+            "cash_available": 21.86, "shares_available": 0,
+            # cash_total REMOVED - no unsettled_cash calculation
+            "average_cost": 112.31,
+            "open_orders": [
+                {"order_id": f"sell{i}", "side": "sell", "limit_price": p, "quantity": 1}
+                for i, p in enumerate([111.83, 112.31, 112.79, 113.27, 113.75])
+            ],
+            "open_lots": [
+                {"open_lot_id": f"lot{i}", "quantity": 1, "cost_basis": c, "is_selectable": False}
+                for i, c in enumerate([111.35, 111.83, 112.31, 112.79, 113.27])
+            ],
+        }
+        result = cloud_reconcile(runtime_state, anchor=115.19, step=0.48)
+        self.assertEqual(result["cancels"], [])
+        self.assertEqual(len(result["places"]), 0)
+        # lot = (21.86 + 5*112.31) / 10 = 583.41 / 10 = 58.34
+        self.assertAlmostEqual(result["diagnostics"]["lot_dollars"], 58.34, places=2)
+
+    def test_3_deposit_settled_buys_resume(self):
+        """Deposit settlement resumes buys with correct lot_dollars."""
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 107.40, "atr": 1.0,
+            "cash_available": 250.0, "cash_total": 588.86, "shares_available": 0,
+            "average_cost": 112.31,
+            "open_orders": [
+                {"order_id": f"sell{i}", "side": "sell", "limit_price": p, "quantity": 1}
+                for i, p in enumerate([111.83, 112.31, 112.79, 113.27, 113.75])
+            ],
+            "open_lots": [
+                {"open_lot_id": f"lot{i}", "quantity": 1, "cost_basis": c, "is_selectable": False}
+                for i, c in enumerate([111.35, 111.83, 112.31, 112.79, 113.27])
+            ],
+        }
+        result = cloud_reconcile(runtime_state, anchor=115.19, step=0.48)
+        self.assertEqual(result["cancels"], [])
+        # lot = (250 + 0 + (588.86-250-0)) / 10 = 588.86 / 10 = 58.886 ≈ 115.04
+        # Actually: unsettled = 588.86 - 250 - 0 = 338.86, total_cash = 250 + 0 + 338.86 = 588.86
+        # equity = 588.86 + 5*112.31 = 1150.41, lot = 115.04
+        self.assertAlmostEqual(result["diagnostics"]["lot_dollars"], 115.04, places=2)
+        buy_places = [p for p in result["places"] if p["side"] == "buy"]
+        # Should place exactly 2 buys at [107.03, 106.55]
+        self.assertEqual(len(buy_places), 2)
+        buy_prices = sorted([p["limit_price"] for p in buy_places])
+        self.assertAlmostEqual(buy_prices[0], 106.55, places=2)
+        self.assertAlmostEqual(buy_prices[1], 107.03, places=2)
+        sell_places = [p for p in result["places"] if p["side"] == "sell"]
+        self.assertEqual(len(sell_places), 0, "No sell places should be generated")
+
+    def test_4_selectable_mixed_tax_lots(self):
+        """Tax lots only assigned for is_selectable=True lots."""
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 99.00, "atr": 1.0,
+            "cash_available": 8000.0, "shares_available": 2, "cash_total": 8000.0,
+            "open_orders": [],
+            "open_lots": [
+                {"open_lot_id": "lot_sel", "quantity": 1, "cost_basis": 100.00, "is_selectable": True},
+                {"open_lot_id": "lot_no_sel", "quantity": 1, "cost_basis": 100.48, "is_selectable": False},
+            ],
+        }
+        result = cloud_reconcile(runtime_state, anchor=100.00, step=0.48)
+        # Exits at 100.48 (from 100.00) and 100.96 (from 100.48)
+        sell_places = [p for p in result["places"] if p["side"] == "sell"]
+        self.assertEqual(len(sell_places), 2)
+        # Find sell at 100.48 (should have tax_lots), and 100.96 (should not)
+        sell_100_48 = [p for p in sell_places if abs(p["limit_price"] - 100.48) < 0.01]
+        sell_100_96 = [p for p in sell_places if abs(p["limit_price"] - 100.96) < 0.01]
+        self.assertEqual(len(sell_100_48), 1, "Should have sell @100.48")
+        self.assertEqual(len(sell_100_96), 1, "Should have sell @100.96")
+        # 100.48 exit is from 100.00 lot (selectable) - should have tax_lots
+        self.assertIn("tax_lots", sell_100_48[0], "Sell @100.48 should have tax_lots (from selectable lot)")
+        # 100.96 exit is from 100.48 lot (not selectable) - should NOT have tax_lots
+        self.assertNotIn("tax_lots", sell_100_96[0], "Sell @100.96 should not have tax_lots (non-selectable lot)")
+        self.assertGreaterEqual(result["diagnostics"].get("sell_fifo_fallback", 0), 1)
+
+    def test_5_sells_frozen_no_lots(self):
+        """Shares held but no lots => sells are frozen, untouched."""
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 110.00, "atr": 1.0,
+            "cash_available": 8000.0, "shares_available": 1, "cash_total": 8000.0,
+            "open_orders": [
+                {"order_id": "s1", "side": "sell", "limit_price": 111.00, "quantity": 1},
+                {"order_id": "s2", "side": "sell", "limit_price": 111.50, "quantity": 1},
+            ],
+            "open_lots": [],  # NO lots, but shares are held
+        }
+        result = cloud_reconcile(runtime_state, anchor=115.19, step=0.48)
+        # Sells should NOT be cancelled
+        self.assertNotIn("s1", result["cancels"], "Open sell s1 should not be cancelled")
+        self.assertNotIn("s2", result["cancels"], "Open sell s2 should not be cancelled")
+        # No new sell places should be generated
+        sell_places = [p for p in result["places"] if p["side"] == "sell"]
+        self.assertEqual(len(sell_places), 0, "No new sell places when frozen")
+        self.assertTrue(result["diagnostics"]["sells_frozen_no_lots"])
+
+    def test_6_exit_deferred_below_spot(self):
+        """Exits with price <= spot are deferred."""
+        # Part A: spot=105, exit @100.48 is below spot → deferred
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 105.00, "atr": 1.0,
+            "cash_available": 8000.0, "shares_available": 1,
+            "open_orders": [],
+            "open_lots": [
+                {"open_lot_id": "lot1", "quantity": 1, "cost_basis": 100.00, "is_selectable": True},
+            ],
+        }
+        result = cloud_reconcile(runtime_state, anchor=100.00, step=0.48)
+        sell_places = [p for p in result["places"] if p["side"] == "sell"]
+        self.assertEqual(len(sell_places), 0, "No sell at 100.48 when spot=105")
+        self.assertGreaterEqual(result["diagnostics"]["exits_deferred_below_spot"], 1)
+
+        # Part B: spot=99, exit @100.48 is above spot → placed
+        runtime_state["current_price"] = 99.00
+        result = cloud_reconcile(runtime_state, anchor=100.00, step=0.48)
+        sell_places = [p for p in result["places"] if p["side"] == "sell"]
+        self.assertEqual(len(sell_places), 1, "Should have sell @100.48 when spot=99")
+        self.assertAlmostEqual(sell_places[0]["limit_price"], 100.48, places=2)
+
+    def test_7_buffer_accounting(self):
+        """Buffer accounting: buffer_dollars = buffer_lots * lot_dollars."""
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 107.40, "atr": 1.0,
+            "cash_available": 1150.40, "cash_total": 1150.40, "shares_available": 0,
+            "open_orders": [],
+            "open_lots": [],
+        }
+        result = cloud_reconcile(runtime_state, anchor=115.19, step=0.48)
+        # lot = 1150.40 / 10 = 115.04
+        # buffer = 2 * 115.04 = 230.08
+        self.assertAlmostEqual(result["diagnostics"]["lot_dollars"], 115.04, places=2)
+        self.assertAlmostEqual(result["diagnostics"]["buffer_dollars"], 230.08, places=2)
+        buy_places = [p for p in result["places"] if p["side"] == "buy"]
+        self.assertEqual(len(buy_places), 8, "Should place 8 buys")
+        # Verify total buy notional <= cash_available
+        total_notional = sum(p["limit_price"] * p["quantity"] for p in buy_places)
+        self.assertLessEqual(total_notional, 1150.40)
+
+    def test_lattice_slide(self):
+        """Test CHANGE F: lattice produces correct lines below spot."""
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 100.00, "atr": 1.0,
+            "cash_available": 2000.0, "cash_total": 2000.0, "shares_available": 0,
+            "open_orders": [], "open_lots": [],
+        }
+        result = cloud_reconcile(runtime_state, anchor=115.19, step=0.48)
+        buy_places = [p for p in result["places"] if p["side"] == "buy"]
+        self.assertEqual(len(buy_places), 8)
+
+    def test_fixpoint_with_lattice(self):
+        """Test fixpoint: perfect book yields no cancels/places."""
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 115.19, "atr": 1.0,
+            "cash_available": 500.0, "cash_total": 500.0, "shares_available": 0,
+            "open_orders": [], "open_lots": [],
+        }
+        result1 = cloud_reconcile(runtime_state, anchor=115.19, step=0.48)
+
+        perfect_orders = [
+            {"order_id": f"order_{i}", "side": p["side"], "limit_price": p["limit_price"], "quantity": p["quantity"]}
+            for i, p in enumerate(result1["places"])
+        ]
+
+        runtime_state["open_orders"] = perfect_orders
+        result2 = cloud_reconcile(runtime_state, anchor=115.19, step=0.48)
+        self.assertEqual(len(result2["cancels"]), 0)
+        self.assertEqual(len(result2["places"]), 0)
 
 
 if __name__ == "__main__":

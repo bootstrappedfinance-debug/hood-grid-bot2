@@ -26,6 +26,7 @@ NUM_LEVELS = 8
 TICK = 0.01
 TIME_IN_FORCE = "gtc"
 MARKET_HOURS = "regular_hours"
+BUFFER_LOTS = 2  # CHANGE D: number of lots to hold in buffer
 
 
 def floor(x):
@@ -49,11 +50,12 @@ def grid_lines(anchor, step, num_levels):
 def held_shares_by_line(open_lots, anchor, step, num_levels):
     """
     CHANGE C: Attribute held share lots to their nearest grid line.
+    CHANGE F: Remove band restriction (band-unrestricted lattice).
 
     Nearest-line attribution handles buy price improvement (fill cost slightly
     below the limit price): a lot attributes to line L when its cost basis is
-    within step/2 of L. Lots whose cost basis falls outside the grid band (or
-    isn't close enough to any line) attribute to no line and never suppress.
+    within step/2 of L. Lots can now attribute to ANY lattice line, not just
+    those within the original fixed band.
 
     Returns {line_price: total_held_qty}.
     """
@@ -64,29 +66,38 @@ def held_shares_by_line(open_lots, anchor, step, num_levels):
         cost_basis = lot["cost_basis"]
         qty = lot["quantity"]
         i = round((cost_basis - anchor) / step)
-        if -num_levels <= i <= num_levels:
-            line = round(anchor + i * step, 2)
-            if abs(cost_basis - line) <= step / 2 + 1e-9:
-                held[line] = held.get(line, 0) + qty
+        # CHANGE F: removed -num_levels <= i <= num_levels restriction (infinite lattice)
+        line = round(anchor + i * step, 2)
+        if abs(cost_basis - line) <= step / 2 + 1e-9:
+            held[line] = held.get(line, 0) + qty
     return held
 
 
-def compute_dynamic_lot(runtime_state, num_levels=NUM_LEVELS):
+def compute_dynamic_lot(runtime_state, num_levels=NUM_LEVELS, buffer_lots=BUFFER_LOTS):
     """
     CHANGE A: Compute lot_dollars from equity at cost.
+    CHANGE D: Add settlement-aware equity + cash buffer.
 
-    Returns (lot_dollars, equity_at_cost, total_shares, avg_cost_used).
+    Returns (lot_dollars, equity_at_cost, total_shares, avg_cost_used, unsettled_cash).
     """
     current_price = round(runtime_state["current_price"], 2)
     cash_available = runtime_state["cash_available"]
+    cash_total = runtime_state.get("cash_total")  # optional
     shares_available = runtime_state["shares_available"]
     open_orders = runtime_state.get("open_orders", [])
     average_cost = runtime_state.get("average_cost", 0)
 
-    # Total cash includes open buy orders (not yet filled)
-    total_cash = cash_available + sum(
+    # CHANGE D: Calculate open_buy_notional and unsettled cash
+    open_buy_notional = sum(
         o["limit_price"] * o["quantity"] for o in open_orders if o["side"] == "buy"
     )
+    if cash_total is not None:
+        unsettled = max(0, cash_total - cash_available - open_buy_notional)
+    else:
+        unsettled = 0.0
+
+    # Total cash includes open buys and unsettled proceeds
+    total_cash = cash_available + open_buy_notional + unsettled
 
     # Total shares includes open sell orders (not yet filled)
     total_shares = shares_available + sum(
@@ -99,24 +110,27 @@ def compute_dynamic_lot(runtime_state, num_levels=NUM_LEVELS):
     # Equity at cost (what we have if we closed today at current price)
     equity_at_cost = total_cash + total_shares * share_val
 
-    # Lot size
-    lot_dollars = round(equity_at_cost / num_levels, 2)
+    # CHANGE D: Lot size with buffer
+    lot_dollars = round(equity_at_cost / (num_levels + buffer_lots), 2)
 
-    return lot_dollars, equity_at_cost, total_shares, share_val
+    return lot_dollars, equity_at_cost, total_shares, share_val, unsettled
 
 
-def assign_tax_lots(sell_places, open_lots):
+def assign_tax_lots_for_exits(sell_places, open_lots, step):
     """
-    CHANGE B: Assign tax lots to sell orders for tax-aware fulfillment.
+    CHANGE E: Assign tax lots to sell orders for lot-based exits.
+
+    Rework of CHANGE B: only lots with is_selectable == True may be designated.
 
     Modifies sell_places in-place to add tax_lots field (if possible).
     Returns sell_fifo_fallback count and consumed_from_lots dict.
 
-    Tax lot priority:
+    Tax lot priority for fallback (when generating lots unavailable):
     1. GAIN lots (cost_basis < sell_price) first
     2. Within GAIN: highest cost_basis first (nearest below, smallest gain realized)
     3. LOSS lots (cost_basis >= sell_price) second
     4. Within LOSS: lowest cost_basis first (nearest above, smallest loss realized)
+    Restricted to lots with is_selectable == True.
     """
     sell_fifo_fallback = 0
     consumed_from_lots = {}  # {open_lot_id: consumed_qty}
@@ -131,35 +145,67 @@ def assign_tax_lots(sell_places, open_lots):
         sell_price = sell_place["limit_price"]
         sell_qty = sell_place["quantity"]
 
-        # Find candidate lots with remaining quantity
+        # CHANGE E: First, try to use lots that generated this exit (cost_basis + step == sell_price)
+        generating_lots = []
+        for lot in open_lots:
+            if not lot.get("is_selectable", False):
+                continue  # CHANGE E: only selectable lots
+            if round(lot["cost_basis"] + step, 2) == sell_price:
+                lot_id = lot["open_lot_id"]
+                total_qty = lot["quantity"]
+                consumed = consumed_from_lots.get(lot_id, 0)
+                remaining = total_qty - consumed
+                if remaining > 0:
+                    generating_lots.append((lot_id, remaining))
+
+        # If generating lots fully cover, use them
+        if generating_lots:
+            total_available = sum(q for _, q in generating_lots)
+            if total_available >= sell_qty:
+                tax_lots = []
+                still_needed = sell_qty
+                tentative_consumed = {}
+                for lot_id, remaining in generating_lots:
+                    if still_needed <= 0:
+                        break
+                    take_qty = min(remaining, still_needed)
+                    tax_lots.append({"open_lot_id": lot_id, "quantity": take_qty})
+                    tentative_consumed[lot_id] = take_qty
+                    still_needed -= take_qty
+
+                if still_needed <= 0:
+                    for lot_id, qty in tentative_consumed.items():
+                        consumed_from_lots[lot_id] = consumed_from_lots.get(lot_id, 0) + qty
+                    sell_place["tax_lots"] = tax_lots
+                    continue
+
+        # Fallback: gain-preferring selection from selectable lots
         candidates = []
         for lot in open_lots:
+            if not lot.get("is_selectable", False):
+                continue  # CHANGE E: only selectable lots
             lot_id = lot["open_lot_id"]
             total_qty = lot["quantity"]
             consumed = consumed_from_lots.get(lot_id, 0)
             remaining = total_qty - consumed
             if remaining > 0:
                 cost_basis = lot["cost_basis"]
-                # Sort key: (is_loss, sort_cost_basis, lot_id)
-                # is_loss: 0 for gain (cost < S), 1 for loss (cost >= S)
-                # Within GAIN: descending cost (-cost_basis)
-                # Within LOSS: ascending cost (cost_basis)
                 is_loss = 0 if cost_basis < sell_price else 1
                 sort_cost = -cost_basis if is_loss == 0 else cost_basis
                 candidates.append((is_loss, sort_cost, lot_id, cost_basis, remaining))
 
         if not candidates:
-            # No lots available; use FIFO fallback
+            # No selectable lots available; use FIFO fallback
             sell_fifo_fallback += 1
             continue
 
         # Sort candidates by (is_loss, sort_cost, lot_id)
         candidates.sort()
 
-        # Greedily assign lots, tracking tentative consumption
+        # Greedily assign lots
         tax_lots = []
         still_needed = sell_qty
-        tentative_consumed = {}  # Temporary tracking for this sell
+        tentative_consumed = {}
 
         for is_loss, sort_cost, lot_id, cost_basis, remaining in candidates:
             if still_needed <= 0:
@@ -169,35 +215,29 @@ def assign_tax_lots(sell_places, open_lots):
             tentative_consumed[lot_id] = take_qty
             still_needed -= take_qty
 
-            # Cap at 30 lots per order
             if len(tax_lots) >= 30:
                 break
 
-        # Attach tax_lots only if fully covered
         if still_needed <= 0:
-            # Fully covered: commit tentative consumed to global consumed_from_lots
             for lot_id, qty in tentative_consumed.items():
                 consumed_from_lots[lot_id] = consumed_from_lots.get(lot_id, 0) + qty
             sell_place["tax_lots"] = tax_lots
         else:
-            # Cannot fully cover (hit 30-lot cap or insufficient lots); use FIFO fallback
-            # DO NOT commit tentative_consumed (roll back bookkeeping)
             sell_fifo_fallback += 1
-            # Don't attach partial tax_lots
 
     return sell_fifo_fallback, consumed_from_lots
 
 
-def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels=NUM_LEVELS, tick=TICK):
+def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels=NUM_LEVELS, buffer_lots=BUFFER_LOTS, tick=TICK):
     """
-    Core reconciliation logic (stateless, fixed geometry).
+    Core reconciliation logic (v4 with CHANGE D/E/F).
 
-    Input: {symbol, current_price, cash_available, shares_available, open_orders, average_cost?, open_lots?}
+    Input: {symbol, current_price, cash_available, shares_available, open_orders, average_cost?, open_lots?, cash_total?}
     Output: {cancels, places, diagnostics}
 
     Args:
         lot_dollars_override: if provided, use as fixed lot (skip dynamic computation)
-        Otherwise, compute lot_dollars dynamically from equity_at_cost
+        Otherwise, compute lot_dollars dynamically from equity_at_cost with settlement-aware buffer
     """
     current_price = round(runtime_state["current_price"], 2)
     cash_available = runtime_state["cash_available"]
@@ -205,23 +245,62 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
     open_orders = runtime_state.get("open_orders", [])
     open_lots = runtime_state.get("open_lots", [])
 
-    # CHANGE A: Compute or use fixed lot_dollars
+    # CHANGE D: Compute or use fixed lot_dollars (with buffer_lots)
     if lot_dollars_override is not None:
         lot_dollars = lot_dollars_override
         equity_at_cost = None
         total_shares = shares_available
         avg_cost_used = None
+        unsettled = 0.0
     else:
-        lot_dollars, equity_at_cost, total_shares, avg_cost_used = compute_dynamic_lot(
-            runtime_state, num_levels
+        lot_dollars, equity_at_cost, total_shares, avg_cost_used, unsettled = compute_dynamic_lot(
+            runtime_state, num_levels, buffer_lots
         )
 
-    # Generate grid
-    lines = grid_lines(anchor, step, num_levels)
+    # CHANGE F: Generate buy_lines using sliding lattice (not fixed band)
+    if step <= 0:
+        return {
+            "cancels": [],
+            "places": [],
+            "diagnostics": {
+                "anchor": round(anchor, 2),
+                "step": 0.0,
+                "lot_dollars": lot_dollars,
+                "spot": current_price,
+                "num_buys": 0,
+                "num_sells": 0,
+                "cash_budget_used": 0.0,
+                "shares_budget_used": 0,
+                "unsettled_cash": round(unsettled, 2),
+                "buffer_lots": buffer_lots,
+                "buffer_dollars": 0.0,
+                "lot_below_min_line": False,
+                "exits_deferred_below_spot": 0,
+                "sells_frozen_no_lots": False,
+                "buys_suppressed_level_guard": 0,
+            },
+        }
 
-    # Split into buy and sell lines (strictly below/above spot, nearest-first)
-    buy_lines = sorted([l for l in lines if l < current_price], reverse=True)[:num_levels]
-    sell_lines = sorted([l for l in lines if l > current_price])[:num_levels]
+    # CHANGE F: Sliding lattice buys (infinite, not fixed band)
+    i_max = int(floor((current_price - anchor) / step))
+    if round(anchor + i_max * step, 2) >= current_price:
+        i_max -= 1
+    buy_lines = [round(anchor + i * step, 2) for i in range(i_max, i_max - num_levels, -1)]
+
+    # CHANGE E: FAIL-SAFE check: sells_frozen_no_lots
+    # If shares are held but no lots data, don't touch sells (keep them as-is)
+    sells_frozen = False
+    open_sell_qty = sum(o["quantity"] for o in open_orders if o["side"] == "sell")
+    if (shares_available + open_sell_qty > 0) and not open_lots:
+        # CHANGE E: FAIL-SAFE - sells_frozen_no_lots
+        sells_frozen = True
+
+    # CHANGE E: Compute desired exits from open_lots
+    desired_exits = {}  # {exit_price: qty}
+    if open_lots:
+        for lot in open_lots:
+            exit_price = round(lot["cost_basis"] + step, 2)
+            desired_exits[exit_price] = desired_exits.get(exit_price, 0) + lot["quantity"]
 
     # CHANGE C: one-lot-per-level buy guard (attribute held shares to grid lines)
     held_at_line = held_shares_by_line(open_lots, anchor, step, num_levels)
@@ -230,7 +309,8 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
     # Reconcile open orders
     kept_orders = {}
     cancelled_orders = []
-    lines_with_kept = set()
+    lines_with_kept_buys = set()
+    prices_with_kept_sells = set()
 
     for order in open_orders:
         order_id = order["order_id"]
@@ -238,32 +318,44 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
         order_price = round(order["limit_price"], 2)
         order_qty = order["quantity"]
 
-        # Try to match to a grid line
-        matched_line = None
         if side == "buy":
+            # Try to match to buy_lines
+            matched_line = None
             for line in buy_lines:
                 if abs(order_price - line) <= tick / 2:
                     matched_line = line
                     break
-        else:  # sell
-            for line in sell_lines:
-                if abs(order_price - line) <= tick / 2:
-                    matched_line = line
-                    break
 
-        # Keep if price matches, qty matches (using computed lot_dollars), line not already taken
-        if matched_line is not None:
-            qty = desired_qty(lot_dollars, matched_line)
-            # CHANGE C: buy suppressed if the full lot for this line is already held
-            if side == "buy" and qty >= 1 and held_at_line.get(matched_line, 0) >= qty:
-                suppressed_lines.add(matched_line)
-            elif qty >= 1 and order_qty == qty and matched_line not in lines_with_kept:
+            if matched_line is not None:
+                qty = desired_qty(lot_dollars, matched_line)
+                # CHANGE C: buy suppressed if the full lot for this line is already held
+                if qty >= 1 and held_at_line.get(matched_line, 0) >= qty:
+                    suppressed_lines.add(matched_line)
+                elif qty >= 1 and order_qty == qty and matched_line not in lines_with_kept_buys:
+                    kept_orders[order_id] = order
+                    lines_with_kept_buys.add(matched_line)
+                    continue
+
+            cancelled_orders.append(order)
+
+        else:  # sell
+            # CHANGE E: If sells are frozen, keep all existing sells as-is
+            if sells_frozen:
                 kept_orders[order_id] = order
-                lines_with_kept.add(matched_line)
                 continue
 
-        # Cancel order
-        cancelled_orders.append(order)
+            # CHANGE E: Match to desired exits from lots
+            matched_exit_price = None
+            if order_price in desired_exits and order_qty == desired_exits[order_price]:
+                if order_price not in prices_with_kept_sells:
+                    matched_exit_price = order_price
+                    prices_with_kept_sells.add(order_price)
+
+            if matched_exit_price is not None:
+                kept_orders[order_id] = order
+                continue
+
+            cancelled_orders.append(order)
 
     # Calculate available budget (cancelled orders release resources)
     cancelled_buy_cash = sum(
@@ -274,13 +366,11 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
     available_for_buys = cash_available + cancelled_buy_cash
     available_for_sells = shares_available + cancelled_sell_shares
 
-    # Build places (empty lines, respecting budget)
-    places = []
-
-    # Buy side (nearest-first)
+    # Build buy places
+    buy_places = []
     remaining_budget = available_for_buys
     for line in buy_lines:
-        if line in lines_with_kept:
+        if line in lines_with_kept_buys:
             continue
         qty = desired_qty(lot_dollars, line)
         if qty < 1:
@@ -291,7 +381,7 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
             continue
         cost = qty * line
         if cost <= remaining_budget:
-            places.append(
+            buy_places.append(
                 {
                     "side": "buy",
                     "limit_price": round(line, 2),
@@ -304,38 +394,56 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
         else:
             break
 
-    # Sell side (nearest-first)
-    remaining_shares = available_for_sells
-    for line in sell_lines:
-        if line in lines_with_kept:
-            continue
-        qty = desired_qty(lot_dollars, line)
-        if qty < 1:
-            continue
-        if qty <= remaining_shares:
-            places.append(
-                {
+    # CHANGE E: Build sell places from desired exits
+    sell_places = []
+    exits_deferred_below_spot = 0
+
+    if not sells_frozen:
+        # Place desired exits (in ascending price order, nearest first)
+        remaining_shares = available_for_sells
+        for exit_price in sorted(desired_exits.keys()):
+            if exit_price in prices_with_kept_sells:
+                continue  # already have order at this price
+
+            # CHANGE E: Defer exits <= spot (would be market orders)
+            if exit_price <= current_price:
+                exits_deferred_below_spot += desired_exits[exit_price]
+                continue
+
+            desired_qty_at_price = desired_exits[exit_price]
+            if desired_qty_at_price <= remaining_shares:
+                sell_places.append({
                     "side": "sell",
-                    "limit_price": round(line, 2),
-                    "quantity": qty,
+                    "limit_price": exit_price,
+                    "quantity": desired_qty_at_price,
                     "time_in_force": TIME_IN_FORCE,
                     "market_hours": MARKET_HOURS,
-                }
-            )
-            remaining_shares -= qty
-        else:
-            break
+                })
+                remaining_shares -= desired_qty_at_price
+            else:
+                break
 
-    # CHANGE B: Assign tax lots to sell orders
+    places = buy_places + sell_places
+
+    # CHANGE E: Assign tax lots to sell orders (updated for is_selectable)
     sell_fifo_fallback = 0
-    if open_lots:
-        sell_fifo_fallback, _ = assign_tax_lots(places, open_lots)
+    if open_lots and sell_places:
+        sell_fifo_fallback, _ = assign_tax_lots_for_exits(places, open_lots, step)
 
     # Diagnostics
-    num_buys = len([p for p in places if p["side"] == "buy"])
-    num_sells = len([p for p in places if p["side"] == "sell"])
-    cash_budget_used = sum(p["limit_price"] * p["quantity"] for p in places if p["side"] == "buy")
-    shares_budget_used = sum(p["quantity"] for p in places if p["side"] == "sell")
+    num_buys = len(buy_places)
+    num_sells = len(sell_places)
+    cash_budget_used = sum(p["limit_price"] * p["quantity"] for p in buy_places)
+    shares_budget_used = sum(p["quantity"] for p in sell_places)
+
+    # CHANGE D: Compute lot_below_min_line
+    lot_below_min_line = False
+    if buy_lines and lot_dollars > 0:
+        nearest_buy_line = max(buy_lines)  # highest buy line (nearest to spot)
+        if lot_dollars < nearest_buy_line:
+            lot_below_min_line = True
+
+    buffer_dollars = round(buffer_lots * lot_dollars, 2)
 
     diag = {
         "anchor": round(anchor, 2),
@@ -346,6 +454,12 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
         "num_sells": num_sells,
         "cash_budget_used": round(cash_budget_used, 2),
         "shares_budget_used": shares_budget_used,
+        "unsettled_cash": round(unsettled, 2),
+        "buffer_lots": buffer_lots,
+        "buffer_dollars": buffer_dollars,
+        "lot_below_min_line": lot_below_min_line,
+        "exits_deferred_below_spot": exits_deferred_below_spot,
+        "sells_frozen_no_lots": sells_frozen,
     }
 
     # Add dynamic lot diagnostics if computed
@@ -373,6 +487,7 @@ def main():
     parser.add_argument("--anchor", type=float, default=ANCHOR, help="Grid anchor")
     parser.add_argument("--step", type=float, default=STEP, help="Grid step")
     parser.add_argument("--lot", type=float, default=None, help="Fixed lot (overrides dynamic computation)")
+    parser.add_argument("--buffer-lots", type=int, default=BUFFER_LOTS, help="CHANGE D: Number of buffer lots (default 2)")
 
     args = parser.parse_args()
 
@@ -380,7 +495,7 @@ def main():
         with open(args.state_file) as f:
             runtime_state = json.load(f)
 
-        result = reconcile(runtime_state, args.anchor, args.step, lot_dollars_override=args.lot)
+        result = reconcile(runtime_state, args.anchor, args.step, lot_dollars_override=args.lot, buffer_lots=args.buffer_lots)
 
         output = {"cancels": result["cancels"], "places": result["places"], "diagnostics": result["diagnostics"]}
 

@@ -33,6 +33,7 @@ TICK = 0.01
 TIME_IN_FORCE = "gtc"
 MARKET_HOURS = "regular_hours"
 ALLOW_REANCHOR = True  # Cloud stateless deployment: set to False for fixed geometry mode
+BUFFER_LOTS = 2  # CHANGE D: number of lots to hold in buffer (settled cash buffer)
 
 
 def _round_to_tick(price: float, tick: float = TICK) -> float:
@@ -87,7 +88,9 @@ def initialize_grid(
     step = round(step, 2)  # ensure 2 decimals
 
     anchor = round(current_price, 2)
-    lot_dollars = round(cash_available / num_levels, 2)
+    # CHANGE D: divide by (num_levels + buffer_lots) to account for buffer
+    buffer_lots = cfg.get("BUFFER_LOTS", BUFFER_LOTS)
+    lot_dollars = round(cash_available / (num_levels + buffer_lots), 2)
 
     return {
         "anchor": anchor,
@@ -101,23 +104,13 @@ def needs_reanchor(
     grid_state: Dict[str, Any], current_price: float, config: Optional[Dict[str, Any]] = None
 ) -> bool:
     """
-    Check if current price has drifted beyond the grid band.
+    CHANGE F: Vestigial function (lattice makes reanchoring unnecessary).
 
-    Returns True if price > anchor + NUM_LEVELS*step or price < anchor - NUM_LEVELS*step.
+    Always returns False. Anchor is now a fixed lattice origin and never changes.
+    Buys follow price via sliding lattice (nearest lines below spot).
     """
-    if not grid_state or not grid_state.get("initialized"):
-        return False
-
-    cfg = _get_config(config)
-    num_levels = cfg.get("NUM_LEVELS", NUM_LEVELS)
-
-    anchor = grid_state.get("anchor", 0.0)
-    step = grid_state.get("step", 0.0)
-
-    upper_bound = anchor + num_levels * step
-    lower_bound = anchor - num_levels * step
-
-    return current_price > upper_bound or current_price < lower_bound
+    # CHANGE F: Lattice makes reanchoring unnecessary - anchor is fixed
+    return False
 
 
 def grid_lines(
@@ -151,11 +144,12 @@ def held_shares_by_line(
 ) -> Dict[float, int]:
     """
     CHANGE C: Attribute held share lots to their nearest grid line.
+    CHANGE F: Remove band restriction (band-unrestricted lattice).
 
     Nearest-line attribution handles buy price improvement (fill cost slightly
     below the limit price): a lot attributes to line L when its cost basis is
-    within step/2 of L. Lots whose cost basis falls outside the grid band (or
-    isn't close enough to any line) attribute to no line and never suppress.
+    within step/2 of L. Lots can now attribute to ANY lattice line, not just
+    those within the original fixed band.
 
     Returns {line_price: total_held_qty}.
     """
@@ -166,11 +160,57 @@ def held_shares_by_line(
         cost_basis = lot["cost_basis"]
         qty = lot["quantity"]
         i = round((cost_basis - anchor) / step)
-        if -num_levels <= i <= num_levels:
-            line = round(anchor + i * step, 2)
-            if abs(cost_basis - line) <= step / 2 + 1e-9:
-                held[line] = held.get(line, 0) + qty
+        # CHANGE F: removed -num_levels <= i <= num_levels restriction (infinite lattice)
+        line = round(anchor + i * step, 2)
+        if abs(cost_basis - line) <= step / 2 + 1e-9:
+            held[line] = held.get(line, 0) + qty
     return held
+
+
+def compute_dynamic_lot(
+    runtime_state: Dict[str, Any],
+    num_levels: int,
+    buffer_lots: int,
+) -> tuple:
+    """
+    CHANGE D: Compute lot_dollars from equity at cost, settlement-aware.
+
+    Returns (lot_dollars, unsettled_cash).
+    """
+    current_price = round(runtime_state["current_price"], 2)
+    cash_available = runtime_state["cash_available"]
+    cash_total = runtime_state.get("cash_total")  # optional
+    shares_available = runtime_state["shares_available"]
+    open_orders = runtime_state.get("open_orders", [])
+    average_cost = runtime_state.get("average_cost", 0)
+
+    # Calculate unsettled cash
+    open_buy_notional = sum(
+        o["limit_price"] * o["quantity"] for o in open_orders if o["side"] == "buy"
+    )
+    if cash_total is not None:
+        unsettled = max(0, cash_total - cash_available - open_buy_notional)
+    else:
+        unsettled = 0.0
+
+    # Total cash includes open buys and unsettled proceeds
+    total_cash = cash_available + open_buy_notional + unsettled
+
+    # Total shares includes open sells
+    total_shares = shares_available + sum(
+        o["quantity"] for o in open_orders if o["side"] == "sell"
+    )
+
+    # Share valuation
+    share_val = average_cost if average_cost > 0 else current_price
+
+    # Equity at cost
+    equity_at_cost = total_cash + total_shares * share_val
+
+    # Lot size with buffer
+    lot_dollars = round(equity_at_cost / (num_levels + buffer_lots), 2)
+
+    return lot_dollars, unsettled
 
 
 def plan_orders(
@@ -179,62 +219,56 @@ def plan_orders(
     config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Core planning algorithm.
+    Core planning algorithm (v4 with CHANGE D/E/F).
 
     Analyzes current account state and grid, returns a plan of order cancels and places.
 
     Input runtime_state:
-      symbol, current_price, atr, cash_available, shares_available, open_orders
+      symbol, current_price, atr, cash_available, shares_available, open_orders, open_lots, cash_total (optional)
 
     Input grid_state:
-      anchor, step, lot_dollars, initialized (or empty {} on first run)
+      anchor, step, initialized (or empty {} on first run)
 
     Returns dict:
       cancels: [order_id, ...]
       places: [{side, limit_price, quantity, time_in_force, market_hours}, ...]
-      grid_state: updated grid state dict (anchored/initialized)
+      grid_state: updated grid state dict (initialized)
       diagnostics: {step, lot_dollars, anchor, spot, num_buys, num_sells,
-                    cash_budget_used, shares_budget_used, reanchored, initialized_now,
-                    skipped_no_cash}
-
-    Algorithm ensures:
-      - No buy placed at price >= current_price
-      - No sell placed at price <= current_price
-      - Total buy notional <= available_for_buys
-      - Total sell qty <= available_for_sells
-      - FIXPOINT: if open_orders exactly match desired grid, returns empty cancels/places
+                    cash_budget_used, shares_budget_used, initialized_now, skipped_no_cash,
+                    unsettled_cash, buffer_lots, buffer_dollars, lot_below_min_line,
+                    exits_deferred_below_spot, sells_frozen_no_lots, reanchored (always False),
+                    not_initialized, buys_suppressed_level_guard}
     """
     cfg = _get_config(config)
     num_levels = cfg.get("NUM_LEVELS", NUM_LEVELS)
+    buffer_lots = cfg.get("BUFFER_LOTS", BUFFER_LOTS)
     time_in_force = cfg.get("TIME_IN_FORCE", TIME_IN_FORCE)
     market_hours = cfg.get("MARKET_HOURS", MARKET_HOURS)
     allow_reanchor = cfg.get("ALLOW_REANCHOR", ALLOW_REANCHOR)
+    tick = cfg.get("TICK", TICK)
 
     current_price = round(runtime_state["current_price"], 2)
     atr = runtime_state["atr"]
     cash_available = runtime_state["cash_available"]
     shares_available = runtime_state["shares_available"]
     open_orders = runtime_state.get("open_orders", [])
-    open_lots = runtime_state.get("open_lots", [])  # CHANGE C: held tax lots (optional)
+    open_lots = runtime_state.get("open_lots", [])  # CHANGE D: with is_selectable; CHANGE E: for exits
 
     # Copy grid_state so we can mutate it
     gs = dict(grid_state) if grid_state else {}
     initialized_now = False
-    reanchored = False
     skipped_no_cash = False
     not_initialized = False
 
-    # Step 1: Initialize or reanchor grid
-    # Cloud stateless mode: ALLOW_REANCHOR=False means fixed grid geometry (no init, no reanchor)
+    # Step 1: Initialize grid (CHANGE D: divide by num_levels + buffer_lots)
     if not allow_reanchor:
-        # Stateless cloud mode: use provided grid exactly as-is, never init or reanchor
+        # Stateless cloud mode
         if not gs or not gs.get("initialized"):
-            # No valid grid provided; cannot proceed
             not_initialized = True
             return {
                 "cancels": [],
                 "places": [],
-                "grid_state": gs,  # return as-is (empty/uninitialized)
+                "grid_state": gs,
                 "diagnostics": {
                     "step": 0.0,
                     "lot_dollars": 0.0,
@@ -244,25 +278,28 @@ def plan_orders(
                     "num_sells": 0,
                     "cash_budget_used": 0.0,
                     "shares_budget_used": 0,
+                    "unsettled_cash": 0.0,
+                    "buffer_lots": buffer_lots,
+                    "buffer_dollars": 0.0,
+                    "lot_below_min_line": False,
+                    "exits_deferred_below_spot": 0,
+                    "sells_frozen_no_lots": False,
                     "reanchored": False,
                     "initialized_now": False,
                     "skipped_no_cash": False,
                     "not_initialized": True,
-                    "buys_suppressed_level_guard": 0,  # CHANGE C
+                    "buys_suppressed_level_guard": 0,
                 },
             }
-        # Valid grid provided; use it exactly as-is (no reanchor)
     else:
-        # Standard mode: allow initialization and reanchoring
-        # BUG FIX 2: Do NOT initialize if cash <= 0 (prevents lot_dollars from locking at 0)
+        # Standard mode: allow initialization (never reanchors with lattice CHANGE F)
         if not gs or not gs.get("initialized"):
             if cash_available <= 0:
-                # Skip initialization; return empty plan
                 skipped_no_cash = True
                 return {
                     "cancels": [],
                     "places": [],
-                    "grid_state": gs,  # remain uninitialized
+                    "grid_state": gs,
                     "diagnostics": {
                         "step": 0.0,
                         "lot_dollars": 0.0,
@@ -272,45 +309,90 @@ def plan_orders(
                         "num_sells": 0,
                         "cash_budget_used": 0.0,
                         "shares_budget_used": 0,
+                        "unsettled_cash": 0.0,
+                        "buffer_lots": buffer_lots,
+                        "buffer_dollars": 0.0,
+                        "lot_below_min_line": False,
+                        "exits_deferred_below_spot": 0,
+                        "sells_frozen_no_lots": False,
                         "reanchored": False,
                         "initialized_now": False,
                         "skipped_no_cash": True,
                         "not_initialized": False,
-                        "buys_suppressed_level_guard": 0,  # CHANGE C
+                        "buys_suppressed_level_guard": 0,
                     },
                 }
             gs = initialize_grid(current_price, atr, cash_available, config)
             initialized_now = True
-        # BUG FIX 2 (defense): If grid exists but lot_dollars <= 0, re-init if cash > 0
-        elif gs.get("lot_dollars", 0.0) <= 0 and cash_available > 0:
-            gs = initialize_grid(current_price, atr, cash_available, config)
-            initialized_now = True
-        elif needs_reanchor(gs, current_price, config):
-            reanchored = True
-            gs["anchor"] = round(current_price, 2)
-            gs["step"] = _round_to_tick(max(atr * cfg.get("ATR_STEP_FRACTION", ATR_STEP_FRACTION), cfg.get("MIN_STEP", MIN_STEP)), cfg.get("TICK", TICK))
-            gs["step"] = round(gs["step"], 2)
-            # Preserve lot_dollars across reanchor
+        # CHANGE F: never reanchor (lattice makes it meaningless)
 
-    # Step 2: Generate grid lines
-    lines = grid_lines(gs, config)
-    # BUG FIX 1: buy_lines must be NEAREST 8, not FARTHEST 8
-    # Sort descending so highest (nearest to spot) comes first, then take first 8
-    buy_lines = sorted([line for line in lines if line < current_price], reverse=True)[:num_levels]
+    # Step 2: CHANGE D - Compute lot_dollars dynamically
+    lot_dollars, unsettled_cash = compute_dynamic_lot(runtime_state, num_levels, buffer_lots)
+    gs["lot_dollars"] = lot_dollars  # Store for diagnostics
 
-    # sell_lines already ascending (lowest/nearest first is correct for lines > spot)
-    sell_lines = sorted([line for line in lines if line > current_price])[:num_levels]
+    # Step 3: CHANGE F - Generate buy_lines using sliding lattice
+    anchor = gs.get("anchor", 0.0)
+    step = gs.get("step", 0.0)
+    if step <= 0:
+        return {
+            "cancels": [],
+            "places": [],
+            "grid_state": gs,
+            "diagnostics": {
+                "step": 0.0,
+                "lot_dollars": lot_dollars,
+                "anchor": anchor,
+                "spot": current_price,
+                "num_buys": 0,
+                "num_sells": 0,
+                "cash_budget_used": 0.0,
+                "shares_budget_used": 0,
+                "unsettled_cash": unsettled_cash,
+                "buffer_lots": buffer_lots,
+                "buffer_dollars": 0.0,
+                "lot_below_min_line": False,
+                "exits_deferred_below_spot": 0,
+                "sells_frozen_no_lots": False,
+                "reanchored": False,
+                "initialized_now": initialized_now,
+                "skipped_no_cash": skipped_no_cash,
+                "not_initialized": not_initialized,
+                "buys_suppressed_level_guard": 0,
+            },
+        }
 
-    # Step 3: Match open orders to grid and identify keepers vs cancellations
+    # CHANGE F: Compute buy_lines from infinite lattice
+    if step > 0:
+        i_max = int(math.floor((current_price - anchor) / step))
+        if round(anchor + i_max * step, 2) >= current_price:
+            i_max -= 1
+        buy_lines = [round(anchor + i * step, 2) for i in range(i_max, i_max - num_levels, -1)]
+    else:
+        buy_lines = []
+
+    # Step 4: CHANGE E - FAIL-SAFE check: sells_frozen_no_lots
+    # If shares are held but no lots data, don't touch sells (keep them as-is)
+    sells_frozen = False
+    open_sell_qty = sum(o["quantity"] for o in open_orders if o["side"] == "sell")
+    if (shares_available + open_sell_qty > 0) and not open_lots:
+        # CHANGE E: FAIL-SAFE - sells_frozen_no_lots
+        sells_frozen = True
+
+    # Step 5: Compute desired exits from open_lots
+    desired_exits = {}  # {exit_price: qty}
+    if open_lots:
+        for lot in open_lots:
+            exit_price = round(lot["cost_basis"] + step, 2)
+            desired_exits[exit_price] = desired_exits.get(exit_price, 0) + lot["quantity"]
+
+    # Step 6: Match open orders to desired state
     kept_orders = {}
     cancelled_orders = []
-    lines_with_kept_orders = set()
+    lines_with_kept_buys = set()
+    prices_with_kept_sells = set()
 
-    lot_dollars = gs.get("lot_dollars", 0.0)
-    tick = cfg.get("TICK", TICK)
-
-    # CHANGE C: one-lot-per-level buy guard (attribute held shares to grid lines)
-    held_at_line = held_shares_by_line(open_lots, gs.get("anchor", 0.0), gs.get("step", 0.0), num_levels)
+    # CHANGE C: one-lot-per-level buy guard
+    held_at_line = held_shares_by_line(open_lots, anchor, step, num_levels)
     suppressed_lines = set()
 
     for order in open_orders:
@@ -319,39 +401,45 @@ def plan_orders(
         order_price = round(order["limit_price"], 2)
         order_qty = order["quantity"]
 
-        # Try to match this order to a grid line
-        matched_line = None
-        is_buy_side = side == "buy"
-
-        if is_buy_side:
+        if side == "buy":
+            # Match to buy_lines
+            matched_line = None
             for line in buy_lines:
                 if abs(order_price - line) <= tick / 2:
                     matched_line = line
                     break
-        else:  # sell
-            for line in sell_lines:
-                if abs(order_price - line) <= tick / 2:
-                    matched_line = line
-                    break
 
-        # Check if this order should be kept
-        if matched_line is not None:
-            # BUG FIX 3: Use unified _desired_qty helper
-            desired_qty = _desired_qty(lot_dollars, matched_line)
-            # CHANGE C: buy suppressed if the full lot for this line is already held
-            if is_buy_side and desired_qty >= 1 and held_at_line.get(matched_line, 0) >= desired_qty:
-                suppressed_lines.add(matched_line)
-            # Only keep if qty matches desired qty AND line not already occupied
-            # (Lines with desired_qty < 1 must cancel; they're not placed)
-            elif desired_qty >= 1 and order_qty == desired_qty and matched_line not in lines_with_kept_orders:
+            if matched_line is not None:
+                desired_qty = _desired_qty(lot_dollars, matched_line)
+                if desired_qty >= 1 and held_at_line.get(matched_line, 0) >= desired_qty:
+                    suppressed_lines.add(matched_line)
+                elif desired_qty >= 1 and order_qty == desired_qty and matched_line not in lines_with_kept_buys:
+                    kept_orders[order_id] = order
+                    lines_with_kept_buys.add(matched_line)
+                    continue
+
+            cancelled_orders.append(order)
+
+        else:  # sell
+            # CHANGE E: If sells are frozen, keep all existing sells as-is
+            if sells_frozen:
                 kept_orders[order_id] = order
-                lines_with_kept_orders.add(matched_line)
                 continue
 
-        # Order doesn't match desired grid → cancel
-        cancelled_orders.append(order)
+            # CHANGE E: Match to desired exits from lots
+            matched_exit_price = None
+            if order_price in desired_exits and order_qty == desired_exits[order_price]:
+                if order_price not in prices_with_kept_sells:
+                    matched_exit_price = order_price
+                    prices_with_kept_sells.add(order_price)
 
-    # Step 4: Calculate available budget (cancelled orders release resources first)
+            if matched_exit_price is not None:
+                kept_orders[order_id] = order
+                continue
+
+            cancelled_orders.append(order)
+
+    # Step 6: Calculate available budget
     cancelled_buy_cash = sum(
         o["limit_price"] * o["quantity"] for o in cancelled_orders if o["side"] == "buy"
     )
@@ -360,74 +448,81 @@ def plan_orders(
     available_for_buys = cash_available + cancelled_buy_cash
     available_for_sells = shares_available + cancelled_sell_shares
 
-    # Step 5: Build places for empty lines, respecting budget
-    places = []
+    # Step 7: CHANGE E - Build sell places from desired exits
+    sell_places = []
+    exits_deferred_below_spot = 0
 
-    # Buy side: iterate buy_lines nearest-first (already descending/highest-first)
+    if not sells_frozen:
+        # Place desired exits (in ascending price order, nearest first)
+        remaining_sell_shares = available_for_sells
+        for exit_price in sorted(desired_exits.keys()):
+            if exit_price in prices_with_kept_sells:
+                continue  # already have order at this price
+
+            # CHANGE E: Defer exits <= spot (would be market orders)
+            if exit_price <= current_price:
+                exits_deferred_below_spot += desired_exits[exit_price]
+                continue
+
+            desired_qty = desired_exits[exit_price]
+            if desired_qty <= remaining_sell_shares:
+                sell_places.append({
+                    "side": "sell",
+                    "limit_price": exit_price,
+                    "quantity": desired_qty,
+                    "time_in_force": time_in_force,
+                    "market_hours": market_hours,
+                })
+                remaining_sell_shares -= desired_qty
+            else:
+                break
+
+    # Step 8: Build buy places
+    buy_places = []
     remaining_buy_budget = available_for_buys
     for line in buy_lines:
-        if line in lines_with_kept_orders:
-            continue  # already have order here
+        if line in lines_with_kept_buys:
+            continue
 
-        # BUG FIX 3: Use unified _desired_qty helper
         desired_qty = _desired_qty(lot_dollars, line)
         if desired_qty < 1:
-            continue  # too small to place
+            continue
 
-        # CHANGE C: skip (not break) placing a buy where the full lot is already held
         if held_at_line.get(line, 0) >= desired_qty:
             suppressed_lines.add(line)
             continue
 
         cost = desired_qty * line
         if cost <= remaining_buy_budget:
-            places.append(
-                {
-                    "side": "buy",
-                    "limit_price": round(line, 2),
-                    "quantity": desired_qty,
-                    "time_in_force": time_in_force,
-                    "market_hours": market_hours,
-                }
-            )
+            buy_places.append({
+                "side": "buy",
+                "limit_price": round(line, 2),
+                "quantity": desired_qty,
+                "time_in_force": time_in_force,
+                "market_hours": market_hours,
+            })
             remaining_buy_budget -= cost
         else:
-            break  # budget exhausted
+            break
 
-    # Sell side: iterate sell_lines nearest-first (already ascending/lowest-first)
-    remaining_sell_shares = available_for_sells
-    for line in sell_lines:
-        if line in lines_with_kept_orders:
-            continue  # already have order here
+    places = buy_places + sell_places
 
-        # BUG FIX 3: Use unified _desired_qty helper
-        desired_qty = _desired_qty(lot_dollars, line)
-        if desired_qty < 1:
-            continue  # too small to place
+    # Step 9: Build diagnostics
+    num_buys = len(buy_places)
+    num_sells = len(sell_places)
+    cash_budget_used = sum(p["limit_price"] * p["quantity"] for p in buy_places)
+    shares_budget_used = sum(p["quantity"] for p in sell_places)
 
-        if desired_qty <= remaining_sell_shares:
-            places.append(
-                {
-                    "side": "sell",
-                    "limit_price": round(line, 2),
-                    "quantity": desired_qty,
-                    "time_in_force": time_in_force,
-                    "market_hours": market_hours,
-                }
-            )
-            remaining_sell_shares -= desired_qty
-        else:
-            break  # shares exhausted
+    # CHANGE D: Compute lot_below_min_line
+    lot_below_min_line = False
+    if buy_lines and lot_dollars > 0:
+        nearest_buy_line = max(buy_lines)  # highest buy line (nearest to spot)
+        if lot_dollars < nearest_buy_line:
+            lot_below_min_line = True
 
-    # Step 6: Build diagnostics
-    num_buys = len([p for p in places if p["side"] == "buy"])
-    num_sells = len([p for p in places if p["side"] == "sell"])
-    cash_budget_used = sum(
-        p["limit_price"] * p["quantity"] for p in places if p["side"] == "buy"
-    )
-    shares_budget_used = sum(p["quantity"] for p in places if p["side"] == "sell")
+    buffer_dollars = round(buffer_lots * lot_dollars, 2)
 
-    # Step 7: Return full plan
+    # Step 10: Return full plan
     cancels = [o["order_id"] for o in cancelled_orders]
 
     return {
@@ -435,19 +530,25 @@ def plan_orders(
         "places": places,
         "grid_state": gs,
         "diagnostics": {
-            "step": round(gs.get("step", 0.0), 2),
-            "lot_dollars": round(gs.get("lot_dollars", 0.0), 2),
-            "anchor": round(gs.get("anchor", 0.0), 2),
+            "step": round(step, 2),
+            "lot_dollars": round(lot_dollars, 2),
+            "anchor": round(anchor, 2),
             "spot": current_price,
             "num_buys": num_buys,
             "num_sells": num_sells,
             "cash_budget_used": round(cash_budget_used, 2),
             "shares_budget_used": shares_budget_used,
-            "reanchored": reanchored,
+            "unsettled_cash": round(unsettled_cash, 2),
+            "buffer_lots": buffer_lots,
+            "buffer_dollars": buffer_dollars,
+            "lot_below_min_line": lot_below_min_line,
+            "exits_deferred_below_spot": exits_deferred_below_spot,
+            "sells_frozen_no_lots": sells_frozen,
+            "reanchored": False,  # CHANGE F: never reanchors (vestigial for compat)
             "initialized_now": initialized_now,
             "skipped_no_cash": skipped_no_cash,
             "not_initialized": not_initialized,
-            "buys_suppressed_level_guard": len(suppressed_lines),  # CHANGE C
+            "buys_suppressed_level_guard": len(suppressed_lines),
         },
     }
 
@@ -463,6 +564,7 @@ def _get_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         "TIME_IN_FORCE": TIME_IN_FORCE,
         "MARKET_HOURS": MARKET_HOURS,
         "ALLOW_REANCHOR": ALLOW_REANCHOR,
+        "BUFFER_LOTS": BUFFER_LOTS,  # CHANGE D
     }
     if config:
         defaults.update(config)

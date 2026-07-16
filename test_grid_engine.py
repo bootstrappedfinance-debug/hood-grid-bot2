@@ -28,7 +28,8 @@ class TestInitializeGrid(unittest.TestCase):
         result = initialize_grid(current_price=115.54, atr=4.20, cash_available=8000)
         self.assertTrue(result["initialized"])
         self.assertAlmostEqual(result["anchor"], 115.54, places=2)
-        self.assertAlmostEqual(result["lot_dollars"], 1000.0, places=2)  # 8000 / 8
+        # CHANGE D: lot_dollars = cash / (NUM_LEVELS + BUFFER_LOTS) = 8000 / 10 = 800
+        self.assertAlmostEqual(result["lot_dollars"], 800.0, places=2)
         # step = max(4.20 * 0.25, 0.25) = max(1.05, 0.25) = 1.05
         self.assertAlmostEqual(result["step"], 1.05, places=2)
 
@@ -39,10 +40,10 @@ class TestInitializeGrid(unittest.TestCase):
         self.assertAlmostEqual(result["step"], 0.25, places=2)
 
     def test_lot_dollars_calculation(self):
-        """Test lot_dollars = cash / NUM_LEVELS (8)."""
+        """CHANGE D: Test lot_dollars = cash / (NUM_LEVELS + BUFFER_LOTS) = cash / 10."""
         result = initialize_grid(current_price=100.0, atr=1.0, cash_available=2400)
-        # 2400 / 8 = 300
-        self.assertAlmostEqual(result["lot_dollars"], 300.0, places=2)
+        # 2400 / 10 = 240
+        self.assertAlmostEqual(result["lot_dollars"], 240.0, places=2)
 
     def test_anchor_rounding(self):
         """Test that anchor is rounded to 2 decimals."""
@@ -66,42 +67,21 @@ class TestInitializeGrid(unittest.TestCase):
 class TestNeedsReanchor(unittest.TestCase):
     """Tests for needs_reanchor()."""
 
-    def test_price_within_band(self):
-        """Price within band should not trigger reanchor."""
+    def test_always_returns_false(self):
+        """CHANGE F: needs_reanchor always returns False (lattice makes reanchoring unnecessary)."""
+        # Test with various grid states and prices
         grid_state = {
             "anchor": 115.0,
             "step": 1.0,
             "lot_dollars": 1000.0,
             "initialized": True,
         }
-        # Band: 115 +/- 8*1 = [107, 123]
+        # No matter the price, reanchor always false
         self.assertFalse(needs_reanchor(grid_state, 115.0))
+        self.assertFalse(needs_reanchor(grid_state, 130.0))  # Far above
+        self.assertFalse(needs_reanchor(grid_state, 100.0))  # Far below
         self.assertFalse(needs_reanchor(grid_state, 107.0))
         self.assertFalse(needs_reanchor(grid_state, 123.0))
-
-    def test_price_above_upper_band(self):
-        """Price above upper band should trigger reanchor."""
-        grid_state = {
-            "anchor": 115.0,
-            "step": 1.0,
-            "lot_dollars": 1000.0,
-            "initialized": True,
-        }
-        # Upper band: 115 + 8*1 = 123
-        self.assertTrue(needs_reanchor(grid_state, 123.01))
-        self.assertTrue(needs_reanchor(grid_state, 130.0))
-
-    def test_price_below_lower_band(self):
-        """Price below lower band should trigger reanchor."""
-        grid_state = {
-            "anchor": 115.0,
-            "step": 1.0,
-            "lot_dollars": 1000.0,
-            "initialized": True,
-        }
-        # Lower band: 115 - 8*1 = 107
-        self.assertTrue(needs_reanchor(grid_state, 106.99))
-        self.assertTrue(needs_reanchor(grid_state, 100.0))
 
     def test_uninitialized_grid(self):
         """Uninitialized grid should not trigger reanchor."""
@@ -288,39 +268,41 @@ class TestFixpointIdempotence(unittest.TestCase):
     """CRITICAL: Test fixpoint idempotence."""
 
     def test_perfect_grid_no_thrash(self):
-        """If open orders perfectly match desired grid, no cancels or places."""
-        # First run: establish grid
+        """If open orders perfectly match desired grid, no cancels or places (fixpoint)."""
+        # Grid at anchor 115, step 1, current_price 115
+        grid_state = {
+            "anchor": 115.00,
+            "step": 1.00,
+            "initialized": True,
+        }
+        # Buy lines: [114, 113, 112, 111, 110, 109, 108, 107]
+        # With lot_dollars = 8000/10 = 800:
+        # qty at each line = floor(800/line) = 7 for all lines
+        perfect_orders = [
+            {"order_id": "b1", "side": "buy", "limit_price": 114.0, "quantity": 7, "state": "confirmed"},
+            {"order_id": "b2", "side": "buy", "limit_price": 113.0, "quantity": 7, "state": "confirmed"},
+            {"order_id": "b3", "side": "buy", "limit_price": 112.0, "quantity": 7, "state": "confirmed"},
+            {"order_id": "b4", "side": "buy", "limit_price": 111.0, "quantity": 7, "state": "confirmed"},
+            {"order_id": "b5", "side": "buy", "limit_price": 110.0, "quantity": 7, "state": "confirmed"},
+            {"order_id": "b6", "side": "buy", "limit_price": 109.0, "quantity": 7, "state": "confirmed"},
+            {"order_id": "b7", "side": "buy", "limit_price": 108.0, "quantity": 7, "state": "confirmed"},
+            {"order_id": "b8", "side": "buy", "limit_price": 107.0, "quantity": 7, "state": "confirmed"},
+        ]
+        # Total notional of open orders: 7*(114+113+112+111+110+109+108+107) = 7*884 = 6188
+        # When these orders are in flight, cash_available is reduced by their notional
         runtime_state = {
             "symbol": "HOOD",
             "current_price": 115.00,
             "atr": 4.00,
-            "cash_available": 8000.0,
+            "cash_available": 8000.0 - 6188.0,  # Reduced by open buy notional
             "shares_available": 0,
-            "open_orders": [],
+            "open_orders": perfect_orders,
         }
-        result1 = plan_orders(runtime_state, {})
-        grid_state = result1["grid_state"]
+        result = plan_orders(runtime_state, grid_state)
 
-        # Now simulate: open orders match the desired grid exactly
-        perfect_orders = []
-        for p in result1["places"]:
-            perfect_orders.append(
-                {
-                    "order_id": f"order_{len(perfect_orders)}",
-                    "side": p["side"],
-                    "limit_price": p["limit_price"],
-                    "quantity": p["quantity"],
-                    "state": "confirmed",
-                }
-            )
-
-        # Second run: with perfect orders in place
-        runtime_state["open_orders"] = perfect_orders
-        result2 = plan_orders(runtime_state, grid_state)
-
-        # Should have no cancels and no places
-        self.assertEqual(len(result2["cancels"]), 0, "Should have no cancels")
-        self.assertEqual(len(result2["places"]), 0, "Should have no places")
+        # Should have no cancels and no places (fixpoint)
+        self.assertEqual(len(result["cancels"]), 0, f"Should have no cancels, got {result['cancels']}")
+        self.assertEqual(len(result["places"]), 0, f"Should have no places, got {result['places']}")
 
 
 class TestStaleOrderCancellation(unittest.TestCase):
@@ -358,27 +340,33 @@ class TestFilledBuyRebalance(unittest.TestCase):
     """Test swing capture: filled buy, spot drops, sell placed at that line."""
 
     def test_filled_buy_swing_capture(self):
-        """When a buy fills and spot drops below, place sell at that line."""
+        """When a buy fills and spot drops below, CHANGE E: place sell from open_lots."""
         # Initial: grid established with buys
         grid_state = {
             "anchor": 115.00,
             "step": 1.00,
-            "lot_dollars": 1000.0,
             "initialized": True,
         }
-        # Spot dropped slightly
+        # Spot dropped slightly; CHANGE E requires open_lots to determine exit prices
+        # If the buy at 115 filled, there's a lot at cost_basis=115
+        # Exit price = round(115 + 1.0, 2) = 116.00
         runtime_state = {
             "symbol": "HOOD",
             "current_price": 114.00,
             "atr": 4.00,
             "cash_available": 8000.0,
-            "shares_available": 8,  # filled buy at 115 line → 8 shares
+            "shares_available": 8,  # filled buy at 115 → 8 shares
             "open_orders": [],  # the buy at 115 is gone (filled)
+            "open_lots": [  # CHANGE E: open_lots define exit prices
+                {"open_lot_id": "lot1", "quantity": 8, "cost_basis": 115.00}
+            ],
         }
         result = plan_orders(runtime_state, grid_state)
-        # Should now place a sell at the line where shares came from
+        # Should now place a sell at exit_price = 115 + step = 116
         sell_orders = [p for p in result["places"] if p["side"] == "sell"]
         self.assertGreater(len(sell_orders), 0, "Should place sell orders for swing capture")
+        # Sell should be at the exit price
+        self.assertIn(116.00, [s["limit_price"] for s in sell_orders])
 
 
 class TestCashBudgetCap(unittest.TestCase):
@@ -429,17 +417,17 @@ class TestShareBudgetCap(unittest.TestCase):
 
 
 class TestReanchor(unittest.TestCase):
-    """Test reanchoring when price drifts beyond band."""
+    """CHANGE F: Reanchoring never happens (lattice makes it unnecessary)."""
 
-    def test_reanchor_above(self):
-        """Spot far above band should trigger reanchor."""
+    def test_reanchor_never_happens_above(self):
+        """Spot far above band: CHANGE F lattice keeps anchor fixed."""
         grid_state = {
             "anchor": 115.00,
             "step": 1.00,
             "lot_dollars": 1000.0,
             "initialized": True,
         }
-        # Upper band: 115 + 8*1 = 123, spot = 130 → reanchor
+        # Upper band: 115 + 8*1 = 123, spot = 130 → would reanchor in v3, but not in v4
         runtime_state = {
             "symbol": "HOOD",
             "current_price": 130.00,
@@ -449,20 +437,21 @@ class TestReanchor(unittest.TestCase):
             "open_orders": [],
         }
         result = plan_orders(runtime_state, grid_state)
-        self.assertTrue(result["diagnostics"]["reanchored"])
-        self.assertAlmostEqual(result["grid_state"]["anchor"], 130.00, places=2)
-        # lot_dollars should be preserved
-        self.assertAlmostEqual(result["grid_state"]["lot_dollars"], 1000.0, places=2)
+        self.assertFalse(result["diagnostics"]["reanchored"])  # Never reanchors in v4
+        self.assertAlmostEqual(result["grid_state"]["anchor"], 115.00, places=2)  # Unchanged
+        # lot_dollars now computed dynamically, not preserved
+        # equity_at_cost = 8000, lot = 8000/10 = 800
+        self.assertAlmostEqual(result["grid_state"]["lot_dollars"], 800.0, places=0)
 
-    def test_reanchor_below(self):
-        """Spot far below band should trigger reanchor."""
+    def test_reanchor_never_happens_below(self):
+        """Spot far below band: CHANGE F lattice keeps anchor fixed."""
         grid_state = {
             "anchor": 115.00,
             "step": 1.00,
             "lot_dollars": 1000.0,
             "initialized": True,
         }
-        # Lower band: 115 - 8*1 = 107, spot = 100 → reanchor
+        # Lower band: 115 - 8*1 = 107, spot = 100 → would reanchor in v3, but not in v4
         runtime_state = {
             "symbol": "HOOD",
             "current_price": 100.00,
@@ -472,10 +461,10 @@ class TestReanchor(unittest.TestCase):
             "open_orders": [],
         }
         result = plan_orders(runtime_state, grid_state)
-        self.assertTrue(result["diagnostics"]["reanchored"])
-        self.assertAlmostEqual(result["grid_state"]["anchor"], 100.00, places=2)
-        # lot_dollars should be preserved
-        self.assertAlmostEqual(result["grid_state"]["lot_dollars"], 1000.0, places=2)
+        self.assertFalse(result["diagnostics"]["reanchored"])  # Never reanchors in v4
+        self.assertAlmostEqual(result["grid_state"]["anchor"], 115.00, places=2)  # Unchanged
+        # lot_dollars now computed dynamically
+        self.assertAlmostEqual(result["grid_state"]["lot_dollars"], 800.0, places=0)
 
 
 class TestQtySkipWhenTooSmall(unittest.TestCase):
@@ -572,41 +561,6 @@ class TestBugFix1OffAnchorBuyOrdering(unittest.TestCase):
         expected = [108.0, 109.0, 110.0, 111.0, 112.0, 113.0, 114.0, 115.0]
         self.assertEqual(buy_prices, expected)
 
-    def test_off_anchor_no_thrash(self):
-        """If open orders match the correct nearest grid, no cancels/places."""
-        # Grid at anchor 115.00
-        grid_state = {
-            "anchor": 115.00,
-            "step": 1.00,
-            "lot_dollars": 1000.0,
-            "initialized": True,
-        }
-        # Current price at 115.60; calculate desired qtys
-        # For each line: qty = floor(1000 / line)
-        # e.g. 115.00 → floor(1000/115) = 8, 114.00 → floor(1000/114) = 8, etc.
-        desired_orders = [
-            {"order_id": "b1", "side": "buy", "limit_price": 108.0, "quantity": 9},
-            {"order_id": "b2", "side": "buy", "limit_price": 109.0, "quantity": 9},
-            {"order_id": "b3", "side": "buy", "limit_price": 110.0, "quantity": 9},
-            {"order_id": "b4", "side": "buy", "limit_price": 111.0, "quantity": 9},
-            {"order_id": "b5", "side": "buy", "limit_price": 112.0, "quantity": 8},
-            {"order_id": "b6", "side": "buy", "limit_price": 113.0, "quantity": 8},
-            {"order_id": "b7", "side": "buy", "limit_price": 114.0, "quantity": 8},
-            {"order_id": "b8", "side": "buy", "limit_price": 115.0, "quantity": 8},
-        ]
-        runtime_state = {
-            "symbol": "HOOD",
-            "current_price": 115.60,
-            "atr": 4.00,
-            "cash_available": 8000.0,
-            "shares_available": 0,
-            "open_orders": desired_orders,
-        }
-        result = plan_orders(runtime_state, grid_state)
-
-        # Should have no cancels and no places (fixpoint)
-        self.assertEqual(len(result["cancels"]), 0, "Should have no cancels")
-        self.assertEqual(len(result["places"]), 0, "Should have no places")
 
 
 class TestBugFix2ZeroCashGuard(unittest.TestCase):
@@ -665,10 +619,12 @@ class TestBugFix2ZeroCashGuard(unittest.TestCase):
         )
         self.assertTrue(result2["grid_state"].get("initialized", False))
         self.assertTrue(result2["diagnostics"]["initialized_now"])
-        self.assertAlmostEqual(result2["grid_state"]["lot_dollars"], 1000.0, places=1)
+        # CHANGE D: lot_dollars now computed dynamically from equity_at_cost
+        # equity = 8000 + 0*avg_cost = 8000, lot = 8000/10 = 800
+        self.assertAlmostEqual(result2["grid_state"]["lot_dollars"], 800.0, places=1)
 
     def test_self_heal_zero_lot_dollars(self):
-        """Grid with lot_dollars=0 but initialized=True, then cash>0 → re-initializes."""
+        """Grid with lot_dollars=0 but initialized=True → CHANGE D dynamic lot_dollars fixes it."""
         # Simulate a corrupted grid state from a zero-cash init (shouldn't happen, but defend)
         bad_grid_state = {
             "anchor": 115.0,
@@ -687,9 +643,11 @@ class TestBugFix2ZeroCashGuard(unittest.TestCase):
             },
             bad_grid_state,
         )
-        # Should re-initialize
-        self.assertTrue(result["diagnostics"]["initialized_now"])
+        # Should NOT re-initialize (already initialized, just recompute lot_dollars)
+        self.assertFalse(result["diagnostics"]["initialized_now"])
+        # CHANGE D: lot_dollars is computed dynamically, not taken from grid_state
         self.assertGreater(result["grid_state"]["lot_dollars"], 0.0)
+        self.assertAlmostEqual(result["grid_state"]["lot_dollars"], 800.0, places=1)
 
 
 class TestCloudStatelessMode(unittest.TestCase):
@@ -790,16 +748,15 @@ class TestCloudStatelessMode(unittest.TestCase):
         self.assertTrue(result["diagnostics"]["not_initialized"])
         self.assertFalse(result["grid_state"].get("initialized", False))
 
-    def test_cloud_backward_compat_default_allow_reanchor(self):
-        """Default ALLOW_REANCHOR=True: existing reanchor behavior unchanged."""
-        # Spot far beyond band should trigger reanchor with default config
+    def test_cloud_default_no_reanchor(self):
+        """CHANGE F: v4 lattice means reanchoring never happens, even with ALLOW_REANCHOR=True."""
+        # Spot far beyond band should NOT reanchor in v4 (lattice keeps anchor fixed)
         grid_state = {
             "anchor": 115.00,
             "step": 1.00,
-            "lot_dollars": 1000.0,
             "initialized": True,
         }
-        # Upper band: 115 + 8*1 = 123, spot = 130
+        # Upper band: 115 + 8*1 = 123, spot = 130 (beyond band)
         runtime_state = {
             "symbol": "HOOD",
             "current_price": 130.00,
@@ -811,10 +768,10 @@ class TestCloudStatelessMode(unittest.TestCase):
         # No config passed (or ALLOW_REANCHOR=True by default)
         result = plan_orders(runtime_state, grid_state)
 
-        # Should reanchor (backward compatibility: default behavior)
-        self.assertTrue(result["diagnostics"]["reanchored"])
-        # Anchor should move to current price
-        self.assertAlmostEqual(result["grid_state"]["anchor"], 130.00, places=2)
+        # Should NOT reanchor (lattice means no reanchoring in v4)
+        self.assertFalse(result["diagnostics"]["reanchored"])
+        # Anchor should stay fixed
+        self.assertAlmostEqual(result["grid_state"]["anchor"], 115.00, places=2)
 
 
 class TestInvariantSweep(unittest.TestCase):
@@ -938,113 +895,141 @@ class TestChangeCOneLotPerLevelGuard(unittest.TestCase):
 
     def test_held_full_lot_suppresses_buy_at_that_line(self):
         """Full lot already held at 112.79 -> no buy there; lower lines still get buys."""
+        # CHANGE D: lot_dollars computed dynamically. To get lot≈115.62:
+        # equity = cash + shares*share_val = cash + 1*113 ≈ 1156.2 → cash ≈ 1043.2
+        # Use fixed grid to ensure step=0.48
+        grid_state = {"anchor": 115.19, "step": 0.48, "initialized": True}
         runtime_state = {
             "symbol": "HOOD",
             "current_price": 113.00,
             "atr": 4.20,
-            "cash_available": 8000.0,
+            "cash_available": 1043.0,
             "shares_available": 1,
             "open_orders": [],
             "open_lots": [{"open_lot_id": "lot1", "quantity": 1, "cost_basis": 112.79}],
         }
-        result = plan_orders(runtime_state, self._fixed_grid(), {"ALLOW_REANCHOR": False})
+        result = plan_orders(runtime_state, grid_state, {"ALLOW_REANCHOR": False})
         buy_prices = [p["limit_price"] for p in result["places"] if p["side"] == "buy"]
+        # With dynamic lot≈115.62: qty@112.79=floor(115.62/112.79)=1, held=1 >= 1 → suppressed
         self.assertNotIn(112.79, buy_prices, "Buy at fully-held line 112.79 should be suppressed")
+        # Lower line 112.31: qty=floor(115.62/112.31)=1, not held, should be placed
         self.assertIn(112.31, buy_prices, "Buy at lower line 112.31 should still be placed")
+        # Sell should be placed for the exit at cost_basis+step=112.79+0.48=113.27
         sell_orders = [p for p in result["places"] if p["side"] == "sell"]
         self.assertGreater(len(sell_orders), 0, "Sell placement should be unaffected by buy guard")
         self.assertEqual(result["diagnostics"]["buys_suppressed_level_guard"], 1)
 
     def test_kept_open_buy_order_cancelled_when_full_lot_held(self):
         """An existing open buy order at a fully-held line must be cancelled, not kept."""
+        # CHANGE D: equity ≈ 1156.2 → lot ≈ 115.62
+        grid_state = {"anchor": 115.19, "step": 0.48, "initialized": True}
         runtime_state = {
             "symbol": "HOOD",
             "current_price": 113.00,
             "atr": 4.20,
-            "cash_available": 8000.0,
+            "cash_available": 1156.2,
             "shares_available": 0,
             "open_orders": [
                 {"order_id": "buy_112_79", "side": "buy", "limit_price": 112.79, "quantity": 1, "state": "confirmed"},
             ],
             "open_lots": [{"open_lot_id": "lot1", "quantity": 1, "cost_basis": 112.79}],
         }
-        result = plan_orders(runtime_state, self._fixed_grid(), {"ALLOW_REANCHOR": False})
+        result = plan_orders(runtime_state, grid_state, {"ALLOW_REANCHOR": False})
         self.assertIn("buy_112_79", result["cancels"])
         self.assertEqual(result["diagnostics"]["buys_suppressed_level_guard"], 1)
 
     def test_price_improved_lot_suppresses_nearest_line(self):
         """Buy price improvement (cost_basis 112.75) still attributes to nearest line 112.79."""
+        # CHANGE D: equity ≈ 1156.2 → lot ≈ 115.62
+        # Use fixed grid to ensure step=0.48
+        grid_state = {"anchor": 115.19, "step": 0.48, "initialized": True}
         runtime_state = {
             "symbol": "HOOD",
             "current_price": 113.00,
             "atr": 4.20,
-            "cash_available": 8000.0,
+            "cash_available": 1043.0,
             "shares_available": 1,
             "open_orders": [],
             "open_lots": [{"open_lot_id": "lot1", "quantity": 1, "cost_basis": 112.75}],
         }
-        result = plan_orders(runtime_state, self._fixed_grid(), {"ALLOW_REANCHOR": False})
+        result = plan_orders(runtime_state, grid_state, {"ALLOW_REANCHOR": False})
         buy_prices = [p["limit_price"] for p in result["places"] if p["side"] == "buy"]
+        # Cost_basis 112.75 → i=round((112.75-115.19)/0.48)=-5 → line=115.19-5*0.48=112.79
+        # Within step/2+1e-9? |112.75-112.79|=0.04 < 0.24000001 ✓
+        # lot≈115.62, qty@112.79=floor(115.62/112.79)=1, held=1 >= 1 → SUPPRESSED
         self.assertNotIn(112.79, buy_prices, "Price-improved lot should still suppress nearest line 112.79")
         self.assertEqual(result["diagnostics"]["buys_suppressed_level_guard"], 1)
 
     def test_lot_far_outside_grid_suppresses_nothing(self):
         """A lot with cost basis far outside the grid band attributes to no line."""
+        # CHANGE D: large cash, no shares with held lot
+        grid_state = {"anchor": 115.19, "step": 0.48, "initialized": True}
         runtime_state = {
             "symbol": "HOOD",
             "current_price": 113.00,
             "atr": 4.20,
-            "cash_available": 8000.0,
+            "cash_available": 1156.2,
             "shares_available": 0,
             "open_orders": [],
             "open_lots": [{"open_lot_id": "lot1", "quantity": 100, "cost_basis": 90.00}],
         }
-        result = plan_orders(runtime_state, self._fixed_grid(), {"ALLOW_REANCHOR": False})
+        result = plan_orders(runtime_state, grid_state, {"ALLOW_REANCHOR": False})
         buy_prices = [p["limit_price"] for p in result["places"] if p["side"] == "buy"]
+        # Cost 90 is far below anchor 115.19, doesn't attribute to any line
         self.assertIn(112.79, buy_prices, "Out-of-grid lot must not suppress any line")
         self.assertEqual(result["diagnostics"]["buys_suppressed_level_guard"], 0)
 
     def test_partial_holding_does_not_suppress(self):
         """Held qty below the level's full desired qty must NOT suppress the buy."""
+        # CHANGE D: To get lot_dollars≈240: equity≈2400, cash+shares*share_val≈2400
+        # With current_price=113, shares=1: cash + 1*113 ≈ 2400 → cash ≈ 2287
+        # But we need to use fixed grid with step=0.48, so pass initialized grid_state
+        grid_state = {"anchor": 115.19, "step": 0.48, "initialized": True}
         runtime_state = {
             "symbol": "HOOD",
             "current_price": 113.00,
             "atr": 4.20,
-            "cash_available": 8000.0,
+            "cash_available": 2287.0,
             "shares_available": 1,
             "open_orders": [],
             "open_lots": [{"open_lot_id": "lot1", "quantity": 1, "cost_basis": 112.79}],
         }
-        # lot_dollars=240 -> desired qty at 112.79 = floor(240/112.79) = 2; held=1 < 2
-        result = plan_orders(runtime_state, self._fixed_grid(lot_dollars=240.0), {"ALLOW_REANCHOR": False})
+        # lot_dollars computed dynamically: equity=2400, lot=240
+        # desired qty at 112.79 = floor(240/112.79) = 2; held=1 < 2 → NOT suppressed
+        result = plan_orders(runtime_state, grid_state, {"ALLOW_REANCHOR": False})
         buys = {p["limit_price"]: p["quantity"] for p in result["places"] if p["side"] == "buy"}
         self.assertIn(112.79, buys, "Partial holding must not suppress the buy")
         self.assertEqual(buys[112.79], 2)
         self.assertEqual(result["diagnostics"]["buys_suppressed_level_guard"], 0)
 
     def test_no_open_lots_regression(self):
-        """Absent open_lots -> behavior identical to before; guard diagnostics stays at 0."""
+        """Absent open_lots -> behavior identical to before; no suppression diagnostics."""
+        grid_state = {"anchor": 115.19, "step": 0.48, "initialized": True}
         runtime_state = {
             "symbol": "HOOD",
             "current_price": 113.00,
             "atr": 4.20,
-            "cash_available": 8000.0,
+            "cash_available": 1156.2,
             "shares_available": 1,
             "open_orders": [],
         }
-        result = plan_orders(runtime_state, self._fixed_grid(), {"ALLOW_REANCHOR": False})
+        result = plan_orders(runtime_state, grid_state, {"ALLOW_REANCHOR": False})
         buy_prices = [p["limit_price"] for p in result["places"] if p["side"] == "buy"]
         self.assertIn(112.79, buy_prices)
+        # When open_lots is absent/empty, buys_suppressed_level_guard should be 0
         self.assertEqual(result["diagnostics"]["buys_suppressed_level_guard"], 0)
 
     def test_multi_cycle_pileup_prevention(self):
         """
-        ACCEPTANCE TEST: price oscillates around the 112.79 buy line for 6 hourly
-        cycles. Each time the 112.79 buy is placed it fills instantly (share held,
-        open_lot recorded); its paired sell never fills. Held shares at 112.79 must
-        never exceed the level's desired qty (1) — i.e. no pileup.
+        ACCEPTANCE TEST: price oscillates around the 112.79 buy line for 6 cycles.
+        Each time the 112.79 buy is placed it fills instantly (share held, open_lot
+        recorded); its paired sell never fills. With CHANGE C guard, held shares at
+        112.79 must never exceed the level's desired qty (1) — i.e. no pileup.
         """
-        cash_available = 8000.0
+        # CHANGE D: Start with equity≈1156.2 → lot≈115.62
+        # Use fixed grid to ensure step=0.48
+        grid_state = {"anchor": 115.19, "step": 0.48, "initialized": True}
+        cash_available = 1156.2
         shares_available = 0
         open_orders = []
         open_lots = []
@@ -1060,7 +1045,7 @@ class TestChangeCOneLotPerLevelGuard(unittest.TestCase):
                 "open_orders": open_orders,
                 "open_lots": open_lots,
             }
-            result = plan_orders(runtime_state, self._fixed_grid(), {"ALLOW_REANCHOR": False})
+            result = plan_orders(runtime_state, grid_state, {"ALLOW_REANCHOR": False})
 
             cancel_ids = set(result["cancels"])
             open_orders = [o for o in open_orders if o["order_id"] not in cancel_ids]
@@ -1091,6 +1076,207 @@ class TestChangeCOneLotPerLevelGuard(unittest.TestCase):
                 1,
                 f"Cycle {cycle}: shares held at 112.79 exceeded desired qty (pileup bug)",
             )
+
+
+class TestChangeDefAndFV4Regression(unittest.TestCase):
+    """CHANGE D/E/F: V4 regression tests (verify live state + new features)."""
+
+    def test_1_live_state_regression(self):
+        """Test LIVE-STATE REGRESSION with exact incident numbers."""
+        grid_state = {"anchor": 115.19, "step": 0.48, "initialized": True}
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 107.40, "atr": 1.0,
+            "cash_available": 21.86, "cash_total": 360.72, "shares_available": 0,
+            "average_cost": 112.31,
+            "open_orders": [
+                {"order_id": f"sell{i}", "side": "sell", "limit_price": p, "quantity": 1}
+                for i, p in enumerate([111.83, 112.31, 112.79, 113.27, 113.75])
+            ],
+            "open_lots": [
+                {"open_lot_id": f"lot{i}", "quantity": 1, "cost_basis": c, "is_selectable": False}
+                for i, c in enumerate([111.35, 111.83, 112.31, 112.79, 113.27])
+            ],
+        }
+        result = plan_orders(runtime_state, grid_state)
+        self.assertEqual(result["cancels"], [])
+        self.assertEqual(len(result["places"]), 0)
+        self.assertEqual(result["diagnostics"]["lot_dollars"], 92.23)
+        self.assertAlmostEqual(result["diagnostics"]["unsettled_cash"], 338.86, places=1)
+        for place in result["places"]:
+            self.assertNotIn("tax_lots", place, "No place should carry tax_lots in live state")
+
+    def test_2_lot_collapse_without_cash_total(self):
+        """Lot collapses when cash_total absent but exits still kept."""
+        grid_state = {"anchor": 115.19, "step": 0.48, "initialized": True}
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 107.40, "atr": 1.0,
+            "cash_available": 21.86, "shares_available": 0,
+            # cash_total REMOVED - no unsettled_cash calculation
+            "average_cost": 112.31,
+            "open_orders": [
+                {"order_id": f"sell{i}", "side": "sell", "limit_price": p, "quantity": 1}
+                for i, p in enumerate([111.83, 112.31, 112.79, 113.27, 113.75])
+            ],
+            "open_lots": [
+                {"open_lot_id": f"lot{i}", "quantity": 1, "cost_basis": c, "is_selectable": False}
+                for i, c in enumerate([111.35, 111.83, 112.31, 112.79, 113.27])
+            ],
+        }
+        result = plan_orders(runtime_state, grid_state)
+        self.assertEqual(result["cancels"], [])
+        self.assertEqual(len(result["places"]), 0)
+        # lot = (21.86 + 5*112.31) / 10 = 583.41 / 10 = 58.34
+        self.assertAlmostEqual(result["diagnostics"]["lot_dollars"], 58.34, places=2)
+
+    def test_3_deposit_settled_buys_resume(self):
+        """Deposit settlement resumes buys with correct lot_dollars."""
+        grid_state = {"anchor": 115.19, "step": 0.48, "initialized": True}
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 107.40, "atr": 1.0,
+            "cash_available": 250.0, "cash_total": 588.86, "shares_available": 0,
+            "average_cost": 112.31,
+            "open_orders": [
+                {"order_id": f"sell{i}", "side": "sell", "limit_price": p, "quantity": 1}
+                for i, p in enumerate([111.83, 112.31, 112.79, 113.27, 113.75])
+            ],
+            "open_lots": [
+                {"open_lot_id": f"lot{i}", "quantity": 1, "cost_basis": c, "is_selectable": False}
+                for i, c in enumerate([111.35, 111.83, 112.31, 112.79, 113.27])
+            ],
+        }
+        result = plan_orders(runtime_state, grid_state)
+        self.assertEqual(result["cancels"], [])
+        # lot = (250 + 0 + (588.86-250-0)) / 10 = 588.86 / 10 = 58.886 ≈ 115.04
+        # Actually: unsettled = 588.86 - 250 - 0 = 338.86, total_cash = 250 + 0 + 338.86 = 588.86
+        # equity = 588.86 + 5*112.31 = 1150.41, lot = 115.04
+        self.assertAlmostEqual(result["diagnostics"]["lot_dollars"], 115.04, places=2)
+        buy_places = [p for p in result["places"] if p["side"] == "buy"]
+        # Should place exactly 2 buys at [107.03, 106.55]
+        self.assertEqual(len(buy_places), 2)
+        buy_prices = sorted([p["limit_price"] for p in buy_places])
+        self.assertAlmostEqual(buy_prices[0], 106.55, places=2)
+        self.assertAlmostEqual(buy_prices[1], 107.03, places=2)
+        sell_places = [p for p in result["places"] if p["side"] == "sell"]
+        self.assertEqual(len(sell_places), 0, "No sell places should be generated")
+
+    def test_4_selectable_mixed_tax_lots(self):
+        """Exit placement respects selectable flag (tax_lots is cloud_reconciler feature)."""
+        grid_state = {"anchor": 100.00, "step": 0.48, "initialized": True}
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 99.00, "atr": 1.0,
+            "cash_available": 8000.0, "shares_available": 2, "cash_total": 8000.0,
+            "open_orders": [],
+            "open_lots": [
+                {"open_lot_id": "lot_sel", "quantity": 1, "cost_basis": 100.00, "is_selectable": True},
+                {"open_lot_id": "lot_no_sel", "quantity": 1, "cost_basis": 100.48, "is_selectable": False},
+            ],
+        }
+        result = plan_orders(runtime_state, grid_state)
+        # Exits at 100.48 (from 100.00) and 100.96 (from 100.48)
+        sell_places = [p for p in result["places"] if p["side"] == "sell"]
+        self.assertEqual(len(sell_places), 2, "Should place exits from both lots")
+        # Verify both exits are generated regardless of is_selectable
+        prices = sorted([p["limit_price"] for p in sell_places])
+        self.assertAlmostEqual(prices[0], 100.48, places=2)
+        self.assertAlmostEqual(prices[1], 100.96, places=2)
+
+    def test_5_sells_frozen_no_lots(self):
+        """Shares held but no lots => sells are frozen, untouched."""
+        grid_state = {"anchor": 115.19, "step": 0.48, "initialized": True}
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 110.00, "atr": 1.0,
+            "cash_available": 8000.0, "shares_available": 1, "cash_total": 8000.0,
+            "open_orders": [
+                {"order_id": "s1", "side": "sell", "limit_price": 111.00, "quantity": 1},
+                {"order_id": "s2", "side": "sell", "limit_price": 111.50, "quantity": 1},
+            ],
+            "open_lots": [],  # NO lots, but shares are held
+        }
+        result = plan_orders(runtime_state, grid_state)
+        # Sells should NOT be cancelled
+        self.assertNotIn("s1", result["cancels"], "Open sell s1 should not be cancelled")
+        self.assertNotIn("s2", result["cancels"], "Open sell s2 should not be cancelled")
+        # No new sell places should be generated
+        sell_places = [p for p in result["places"] if p["side"] == "sell"]
+        self.assertEqual(len(sell_places), 0, "No new sell places when frozen")
+        self.assertTrue(result["diagnostics"]["sells_frozen_no_lots"])
+
+    def test_6_exit_deferred_below_spot(self):
+        """Exits with price <= spot are deferred."""
+        grid_state = {"anchor": 100.00, "step": 0.48, "initialized": True}
+
+        # Part A: spot=105, exit @100.48 is below spot → deferred
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 105.00, "atr": 1.0,
+            "cash_available": 8000.0, "shares_available": 1,
+            "open_orders": [],
+            "open_lots": [
+                {"open_lot_id": "lot1", "quantity": 1, "cost_basis": 100.00, "is_selectable": True},
+            ],
+        }
+        result = plan_orders(runtime_state, grid_state)
+        sell_places = [p for p in result["places"] if p["side"] == "sell"]
+        self.assertEqual(len(sell_places), 0, "No sell at 100.48 when spot=105")
+        self.assertGreaterEqual(result["diagnostics"]["exits_deferred_below_spot"], 1)
+
+        # Part B: spot=99, exit @100.48 is above spot → placed
+        runtime_state["current_price"] = 99.00
+        result = plan_orders(runtime_state, grid_state)
+        sell_places = [p for p in result["places"] if p["side"] == "sell"]
+        self.assertEqual(len(sell_places), 1, "Should have sell @100.48 when spot=99")
+        self.assertAlmostEqual(sell_places[0]["limit_price"], 100.48, places=2)
+
+    def test_7_buffer_accounting(self):
+        """Buffer accounting: buffer_dollars = buffer_lots * lot_dollars."""
+        grid_state = {"anchor": 115.19, "step": 0.48, "initialized": True}
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 107.40, "atr": 1.0,
+            "cash_available": 1150.40, "cash_total": 1150.40, "shares_available": 0,
+            "open_orders": [],
+            "open_lots": [],
+        }
+        result = plan_orders(runtime_state, grid_state)
+        # lot = 1150.40 / 10 = 115.04
+        # buffer = 2 * 115.04 = 230.08
+        self.assertAlmostEqual(result["diagnostics"]["lot_dollars"], 115.04, places=2)
+        self.assertAlmostEqual(result["diagnostics"]["buffer_dollars"], 230.08, places=2)
+        buy_places = [p for p in result["places"] if p["side"] == "buy"]
+        self.assertEqual(len(buy_places), 8, "Should place 8 buys")
+        # Verify total buy notional <= cash_available
+        total_notional = sum(p["limit_price"] * p["quantity"] for p in buy_places)
+        self.assertLessEqual(total_notional, 1150.40)
+
+    def test_lattice_slide(self):
+        """Test CHANGE F: lattice produces correct lines below spot."""
+        grid_state = {"anchor": 115.19, "step": 0.48, "initialized": True}
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 100.00, "atr": 1.0,
+            "cash_available": 2000.0, "cash_total": 2000.0, "shares_available": 0,
+            "open_orders": [], "open_lots": [],
+        }
+        result = plan_orders(runtime_state, grid_state)
+        buy_places = [p for p in result["places"] if p["side"] == "buy"]
+        self.assertEqual(len(buy_places), 8)
+
+    def test_fixpoint_with_lattice(self):
+        """Test fixpoint: perfect book yields no cancels/places."""
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 115.19, "atr": 1.0,
+            "cash_available": 500.0, "cash_total": 500.0, "shares_available": 0,
+            "open_orders": [], "open_lots": [],
+        }
+        result1 = plan_orders(runtime_state, {})
+        grid_state = result1["grid_state"]
+
+        perfect_orders = [
+            {"order_id": f"order_{i}", "side": p["side"], "limit_price": p["limit_price"], "quantity": p["quantity"]}
+            for i, p in enumerate(result1["places"])
+        ]
+
+        runtime_state["open_orders"] = perfect_orders
+        result2 = plan_orders(runtime_state, grid_state)
+        self.assertEqual(len(result2["cancels"]), 0)
+        self.assertEqual(len(result2["places"]), 0)
 
 
 if __name__ == "__main__":
