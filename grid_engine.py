@@ -146,6 +146,33 @@ def grid_lines(
     return lines
 
 
+def held_shares_by_line(
+    open_lots: List[Dict[str, Any]], anchor: float, step: float, num_levels: int
+) -> Dict[float, int]:
+    """
+    CHANGE C: Attribute held share lots to their nearest grid line.
+
+    Nearest-line attribution handles buy price improvement (fill cost slightly
+    below the limit price): a lot attributes to line L when its cost basis is
+    within step/2 of L. Lots whose cost basis falls outside the grid band (or
+    isn't close enough to any line) attribute to no line and never suppress.
+
+    Returns {line_price: total_held_qty}.
+    """
+    held: Dict[float, int] = {}
+    if step <= 0:
+        return held
+    for lot in open_lots:
+        cost_basis = lot["cost_basis"]
+        qty = lot["quantity"]
+        i = round((cost_basis - anchor) / step)
+        if -num_levels <= i <= num_levels:
+            line = round(anchor + i * step, 2)
+            if abs(cost_basis - line) <= step / 2 + 1e-9:
+                held[line] = held.get(line, 0) + qty
+    return held
+
+
 def plan_orders(
     runtime_state: Dict[str, Any],
     grid_state: Dict[str, Any],
@@ -188,6 +215,7 @@ def plan_orders(
     cash_available = runtime_state["cash_available"]
     shares_available = runtime_state["shares_available"]
     open_orders = runtime_state.get("open_orders", [])
+    open_lots = runtime_state.get("open_lots", [])  # CHANGE C: held tax lots (optional)
 
     # Copy grid_state so we can mutate it
     gs = dict(grid_state) if grid_state else {}
@@ -220,6 +248,7 @@ def plan_orders(
                     "initialized_now": False,
                     "skipped_no_cash": False,
                     "not_initialized": True,
+                    "buys_suppressed_level_guard": 0,  # CHANGE C
                 },
             }
         # Valid grid provided; use it exactly as-is (no reanchor)
@@ -247,6 +276,7 @@ def plan_orders(
                         "initialized_now": False,
                         "skipped_no_cash": True,
                         "not_initialized": False,
+                        "buys_suppressed_level_guard": 0,  # CHANGE C
                     },
                 }
             gs = initialize_grid(current_price, atr, cash_available, config)
@@ -279,6 +309,10 @@ def plan_orders(
     lot_dollars = gs.get("lot_dollars", 0.0)
     tick = cfg.get("TICK", TICK)
 
+    # CHANGE C: one-lot-per-level buy guard (attribute held shares to grid lines)
+    held_at_line = held_shares_by_line(open_lots, gs.get("anchor", 0.0), gs.get("step", 0.0), num_levels)
+    suppressed_lines = set()
+
     for order in open_orders:
         order_id = order["order_id"]
         side = order["side"]
@@ -304,9 +338,12 @@ def plan_orders(
         if matched_line is not None:
             # BUG FIX 3: Use unified _desired_qty helper
             desired_qty = _desired_qty(lot_dollars, matched_line)
+            # CHANGE C: buy suppressed if the full lot for this line is already held
+            if is_buy_side and desired_qty >= 1 and held_at_line.get(matched_line, 0) >= desired_qty:
+                suppressed_lines.add(matched_line)
             # Only keep if qty matches desired qty AND line not already occupied
             # (Lines with desired_qty < 1 must cancel; they're not placed)
-            if desired_qty >= 1 and order_qty == desired_qty and matched_line not in lines_with_kept_orders:
+            elif desired_qty >= 1 and order_qty == desired_qty and matched_line not in lines_with_kept_orders:
                 kept_orders[order_id] = order
                 lines_with_kept_orders.add(matched_line)
                 continue
@@ -336,6 +373,11 @@ def plan_orders(
         desired_qty = _desired_qty(lot_dollars, line)
         if desired_qty < 1:
             continue  # too small to place
+
+        # CHANGE C: skip (not break) placing a buy where the full lot is already held
+        if held_at_line.get(line, 0) >= desired_qty:
+            suppressed_lines.add(line)
+            continue
 
         cost = desired_qty * line
         if cost <= remaining_buy_budget:
@@ -405,6 +447,7 @@ def plan_orders(
             "initialized_now": initialized_now,
             "skipped_no_cash": skipped_no_cash,
             "not_initialized": not_initialized,
+            "buys_suppressed_level_guard": len(suppressed_lines),  # CHANGE C
         },
     }
 
@@ -440,7 +483,7 @@ def cmd_plan(args):
             with open(args.grid_file, "r") as f:
                 content = f.read().strip()
                 if content:
-                    grid_state = json.load(Path(args.grid_file).open())
+                    grid_state = json.loads(content)
 
         # Run plan_orders
         result = plan_orders(runtime_state, grid_state)

@@ -844,5 +844,212 @@ class TestDifferentialWithFixedLot(unittest.TestCase):
             self.assertEqual(cp["quantity"], ep["quantity"])
 
 
+class TestChangeCOneLotPerLevelGuard(unittest.TestCase):
+    """CHANGE C: one-lot-per-level buy guard (prevents share pileup at an oscillating line)."""
+
+    def test_held_full_lot_suppresses_buy_at_that_line(self):
+        """Full lot already held at 112.79 -> no buy there; lower lines still get buys."""
+        runtime_state = {
+            "symbol": "HOOD",
+            "current_price": 113.00,
+            "atr": 4.20,
+            "cash_available": 8000.0,
+            "shares_available": 1,
+            "open_orders": [],
+            "open_lots": [{"open_lot_id": "lot1", "quantity": 1, "cost_basis": 112.79}],
+        }
+        result = cloud_reconcile(runtime_state, ANCHOR, STEP, LOT_DOLLARS)
+        buy_prices = [p["limit_price"] for p in result["places"] if p["side"] == "buy"]
+        self.assertNotIn(112.79, buy_prices, "Buy at fully-held line 112.79 should be suppressed")
+        self.assertIn(112.31, buy_prices, "Buy at lower line 112.31 should still be placed")
+        # Sell placement unaffected by the buy-side guard
+        sell_orders = [p for p in result["places"] if p["side"] == "sell"]
+        self.assertGreater(len(sell_orders), 0, "Sell placement should be unaffected by buy guard")
+        self.assertEqual(result["diagnostics"]["buys_suppressed_level_guard"], 1)
+
+    def test_kept_open_buy_order_cancelled_when_full_lot_held(self):
+        """An existing open buy order at a fully-held line must be cancelled, not kept."""
+        runtime_state = {
+            "symbol": "HOOD",
+            "current_price": 113.00,
+            "atr": 4.20,
+            "cash_available": 8000.0,
+            "shares_available": 0,
+            "open_orders": [
+                {"order_id": "buy_112_79", "side": "buy", "limit_price": 112.79, "quantity": 1, "state": "confirmed"},
+            ],
+            "open_lots": [{"open_lot_id": "lot1", "quantity": 1, "cost_basis": 112.79}],
+        }
+        result = cloud_reconcile(runtime_state, ANCHOR, STEP, LOT_DOLLARS)
+        self.assertIn("buy_112_79", result["cancels"])
+        self.assertEqual(result["diagnostics"]["buys_suppressed_level_guard"], 1)
+
+    def test_price_improved_lot_suppresses_nearest_line(self):
+        """Buy price improvement (cost_basis 112.75) still attributes to nearest line 112.79."""
+        runtime_state = {
+            "symbol": "HOOD",
+            "current_price": 113.00,
+            "atr": 4.20,
+            "cash_available": 8000.0,
+            "shares_available": 1,
+            "open_orders": [],
+            "open_lots": [{"open_lot_id": "lot1", "quantity": 1, "cost_basis": 112.75}],
+        }
+        result = cloud_reconcile(runtime_state, ANCHOR, STEP, LOT_DOLLARS)
+        buy_prices = [p["limit_price"] for p in result["places"] if p["side"] == "buy"]
+        self.assertNotIn(112.79, buy_prices, "Price-improved lot should still suppress nearest line 112.79")
+        self.assertEqual(result["diagnostics"]["buys_suppressed_level_guard"], 1)
+
+    def test_lot_far_outside_grid_suppresses_nothing(self):
+        """A lot with cost basis far outside the grid band attributes to no line."""
+        runtime_state = {
+            "symbol": "HOOD",
+            "current_price": 113.00,
+            "atr": 4.20,
+            "cash_available": 8000.0,
+            "shares_available": 0,
+            "open_orders": [],
+            "open_lots": [{"open_lot_id": "lot1", "quantity": 100, "cost_basis": 90.00}],
+        }
+        result = cloud_reconcile(runtime_state, ANCHOR, STEP, LOT_DOLLARS)
+        buy_prices = [p["limit_price"] for p in result["places"] if p["side"] == "buy"]
+        self.assertIn(112.79, buy_prices, "Out-of-grid lot must not suppress any line")
+        self.assertEqual(result["diagnostics"]["buys_suppressed_level_guard"], 0)
+
+    def test_partial_holding_does_not_suppress(self):
+        """Held qty below the level's full desired qty must NOT suppress the buy."""
+        runtime_state = {
+            "symbol": "HOOD",
+            "current_price": 113.00,
+            "atr": 4.20,
+            "cash_available": 8000.0,
+            "shares_available": 1,
+            "open_orders": [],
+            "open_lots": [{"open_lot_id": "lot1", "quantity": 1, "cost_basis": 112.79}],
+        }
+        # lot_dollars=240 -> desired qty at 112.79 = floor(240/112.79) = 2; held=1 < 2
+        result = cloud_reconcile(runtime_state, ANCHOR, STEP, lot_dollars_override=240.0)
+        buys = {p["limit_price"]: p["quantity"] for p in result["places"] if p["side"] == "buy"}
+        self.assertIn(112.79, buys, "Partial holding must not suppress the buy")
+        self.assertEqual(buys[112.79], 2)
+        self.assertEqual(result["diagnostics"]["buys_suppressed_level_guard"], 0)
+
+    def test_no_open_lots_regression(self):
+        """Absent open_lots -> behavior identical to before; no suppression diagnostics key."""
+        runtime_state = {
+            "symbol": "HOOD",
+            "current_price": 113.00,
+            "atr": 4.20,
+            "cash_available": 8000.0,
+            "shares_available": 1,
+            "open_orders": [],
+        }
+        result = cloud_reconcile(runtime_state, ANCHOR, STEP, LOT_DOLLARS)
+        buy_prices = [p["limit_price"] for p in result["places"] if p["side"] == "buy"]
+        self.assertIn(112.79, buy_prices)
+        self.assertNotIn("buys_suppressed_level_guard", result["diagnostics"])
+
+    def test_empty_open_lots_list_regression(self):
+        """Empty open_lots list -> same as absent (no suppression diagnostics key)."""
+        runtime_state = {
+            "symbol": "HOOD",
+            "current_price": 113.00,
+            "atr": 4.20,
+            "cash_available": 8000.0,
+            "shares_available": 1,
+            "open_orders": [],
+            "open_lots": [],
+        }
+        result = cloud_reconcile(runtime_state, ANCHOR, STEP, LOT_DOLLARS)
+        buy_prices = [p["limit_price"] for p in result["places"] if p["side"] == "buy"]
+        self.assertIn(112.79, buy_prices)
+        self.assertNotIn("buys_suppressed_level_guard", result["diagnostics"])
+
+    def test_differential_with_open_lots(self):
+        """cloud_reconciler and grid_engine must agree when open_lots trigger the guard."""
+        runtime_state = {
+            "symbol": "HOOD",
+            "current_price": 113.00,
+            "atr": 4.20,
+            "cash_available": 8000.0,
+            "shares_available": 1,
+            "open_orders": [],
+            "open_lots": [{"open_lot_id": "lot1", "quantity": 1, "cost_basis": 112.79}],
+        }
+        cloud_result = cloud_reconcile(runtime_state, ANCHOR, STEP, LOT_DOLLARS)
+        engine_grid = {"anchor": ANCHOR, "step": STEP, "lot_dollars": LOT_DOLLARS, "initialized": True}
+        engine_result = engine_plan_orders(runtime_state, engine_grid, {"ALLOW_REANCHOR": False})
+
+        cloud_cancels = set(cloud_result["cancels"])
+        engine_cancels = set(engine_result["cancels"])
+        self.assertEqual(cloud_cancels, engine_cancels, "Cancels should match")
+
+        cloud_places = normalize_places(cloud_result["places"])
+        engine_places = normalize_places(engine_result["places"])
+        self.assertEqual(len(cloud_places), len(engine_places), "Places count should match")
+
+        for cp, ep in zip(cloud_places, engine_places):
+            self.assertEqual(cp["side"], ep["side"])
+            self.assertAlmostEqual(cp["limit_price"], ep["limit_price"], places=2)
+            self.assertEqual(cp["quantity"], ep["quantity"])
+
+    def test_multi_cycle_pileup_prevention(self):
+        """
+        ACCEPTANCE TEST: price oscillates around the 112.79 buy line for 6 hourly
+        cycles. Each time the 112.79 buy is placed it fills instantly (share held,
+        open_lot recorded); its paired sell never fills. Held shares at 112.79 must
+        never exceed the level's desired qty (1) — i.e. no pileup.
+        """
+        cash_available = 8000.0
+        shares_available = 0
+        open_orders = []
+        open_lots = []
+        next_id = 0
+
+        for cycle in range(6):
+            runtime_state = {
+                "symbol": "HOOD",
+                "current_price": 113.00,
+                "atr": 4.20,
+                "cash_available": cash_available,
+                "shares_available": shares_available,
+                "open_orders": open_orders,
+                "open_lots": open_lots,
+            }
+            result = cloud_reconcile(runtime_state, ANCHOR, STEP, LOT_DOLLARS)
+
+            # Apply cancels
+            cancel_ids = set(result["cancels"])
+            open_orders = [o for o in open_orders if o["order_id"] not in cancel_ids]
+
+            # Apply places: the 112.79 buy fills instantly; everything else stays open
+            for p in result["places"]:
+                if p["side"] == "buy" and abs(p["limit_price"] - 112.79) < 1e-6:
+                    shares_available += p["quantity"]
+                    cash_available -= p["limit_price"] * p["quantity"]
+                    open_lots.append(
+                        {"open_lot_id": f"lot_{next_id}", "quantity": p["quantity"], "cost_basis": p["limit_price"]}
+                    )
+                    next_id += 1
+                else:
+                    open_orders.append(
+                        {
+                            "order_id": f"order_{next_id}",
+                            "side": p["side"],
+                            "limit_price": p["limit_price"],
+                            "quantity": p["quantity"],
+                            "state": "confirmed",
+                        }
+                    )
+                    next_id += 1
+
+            held_at_112_79 = sum(l["quantity"] for l in open_lots if abs(l["cost_basis"] - 112.79) < 1e-6)
+            self.assertLessEqual(
+                held_at_112_79,
+                1,
+                f"Cycle {cycle}: shares held at 112.79 exceeded desired qty (pileup bug)",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

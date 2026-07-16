@@ -46,6 +46,31 @@ def grid_lines(anchor, step, num_levels):
     return [round(anchor + i * step, 2) for i in range(-num_levels, num_levels + 1)]
 
 
+def held_shares_by_line(open_lots, anchor, step, num_levels):
+    """
+    CHANGE C: Attribute held share lots to their nearest grid line.
+
+    Nearest-line attribution handles buy price improvement (fill cost slightly
+    below the limit price): a lot attributes to line L when its cost basis is
+    within step/2 of L. Lots whose cost basis falls outside the grid band (or
+    isn't close enough to any line) attribute to no line and never suppress.
+
+    Returns {line_price: total_held_qty}.
+    """
+    held = {}
+    if step <= 0:
+        return held
+    for lot in open_lots:
+        cost_basis = lot["cost_basis"]
+        qty = lot["quantity"]
+        i = round((cost_basis - anchor) / step)
+        if -num_levels <= i <= num_levels:
+            line = round(anchor + i * step, 2)
+            if abs(cost_basis - line) <= step / 2 + 1e-9:
+                held[line] = held.get(line, 0) + qty
+    return held
+
+
 def compute_dynamic_lot(runtime_state, num_levels=NUM_LEVELS):
     """
     CHANGE A: Compute lot_dollars from equity at cost.
@@ -198,6 +223,10 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
     buy_lines = sorted([l for l in lines if l < current_price], reverse=True)[:num_levels]
     sell_lines = sorted([l for l in lines if l > current_price])[:num_levels]
 
+    # CHANGE C: one-lot-per-level buy guard (attribute held shares to grid lines)
+    held_at_line = held_shares_by_line(open_lots, anchor, step, num_levels)
+    suppressed_lines = set()
+
     # Reconcile open orders
     kept_orders = {}
     cancelled_orders = []
@@ -225,7 +254,10 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
         # Keep if price matches, qty matches (using computed lot_dollars), line not already taken
         if matched_line is not None:
             qty = desired_qty(lot_dollars, matched_line)
-            if qty >= 1 and order_qty == qty and matched_line not in lines_with_kept:
+            # CHANGE C: buy suppressed if the full lot for this line is already held
+            if side == "buy" and qty >= 1 and held_at_line.get(matched_line, 0) >= qty:
+                suppressed_lines.add(matched_line)
+            elif qty >= 1 and order_qty == qty and matched_line not in lines_with_kept:
                 kept_orders[order_id] = order
                 lines_with_kept.add(matched_line)
                 continue
@@ -252,6 +284,10 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
             continue
         qty = desired_qty(lot_dollars, line)
         if qty < 1:
+            continue
+        # CHANGE C: skip (not break) placing a buy where the full lot is already held
+        if held_at_line.get(line, 0) >= qty:
+            suppressed_lines.add(line)
             continue
         cost = qty * line
         if cost <= remaining_budget:
@@ -318,9 +354,10 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
         diag["total_shares"] = int(total_shares) if total_shares == int(total_shares) else total_shares
         diag["avg_cost_used"] = round(avg_cost_used, 2) if avg_cost_used else None
 
-    # Add tax lot fallback count
+    # Add tax lot fallback count and CHANGE C level-guard suppression count
     if open_lots:
         diag["sell_fifo_fallback"] = sell_fifo_fallback
+        diag["buys_suppressed_level_guard"] = len(suppressed_lines)
 
     return {
         "cancels": [o["order_id"] for o in cancelled_orders],

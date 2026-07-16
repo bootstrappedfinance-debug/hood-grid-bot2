@@ -921,5 +921,177 @@ class TestInvariantSweep(unittest.TestCase):
         self.assertEqual(len(prices), len(set(prices)), "Duplicate prices found")
 
 
+class TestChangeCOneLotPerLevelGuard(unittest.TestCase):
+    """CHANGE C: one-lot-per-level buy guard (mirrors core cases from test_cloud_reconciler.py)."""
+
+    ANCHOR = 115.19
+    STEP = 0.48
+    LOT_DOLLARS = 115.62
+
+    def _fixed_grid(self, lot_dollars=None):
+        return {
+            "anchor": self.ANCHOR,
+            "step": self.STEP,
+            "lot_dollars": lot_dollars if lot_dollars is not None else self.LOT_DOLLARS,
+            "initialized": True,
+        }
+
+    def test_held_full_lot_suppresses_buy_at_that_line(self):
+        """Full lot already held at 112.79 -> no buy there; lower lines still get buys."""
+        runtime_state = {
+            "symbol": "HOOD",
+            "current_price": 113.00,
+            "atr": 4.20,
+            "cash_available": 8000.0,
+            "shares_available": 1,
+            "open_orders": [],
+            "open_lots": [{"open_lot_id": "lot1", "quantity": 1, "cost_basis": 112.79}],
+        }
+        result = plan_orders(runtime_state, self._fixed_grid(), {"ALLOW_REANCHOR": False})
+        buy_prices = [p["limit_price"] for p in result["places"] if p["side"] == "buy"]
+        self.assertNotIn(112.79, buy_prices, "Buy at fully-held line 112.79 should be suppressed")
+        self.assertIn(112.31, buy_prices, "Buy at lower line 112.31 should still be placed")
+        sell_orders = [p for p in result["places"] if p["side"] == "sell"]
+        self.assertGreater(len(sell_orders), 0, "Sell placement should be unaffected by buy guard")
+        self.assertEqual(result["diagnostics"]["buys_suppressed_level_guard"], 1)
+
+    def test_kept_open_buy_order_cancelled_when_full_lot_held(self):
+        """An existing open buy order at a fully-held line must be cancelled, not kept."""
+        runtime_state = {
+            "symbol": "HOOD",
+            "current_price": 113.00,
+            "atr": 4.20,
+            "cash_available": 8000.0,
+            "shares_available": 0,
+            "open_orders": [
+                {"order_id": "buy_112_79", "side": "buy", "limit_price": 112.79, "quantity": 1, "state": "confirmed"},
+            ],
+            "open_lots": [{"open_lot_id": "lot1", "quantity": 1, "cost_basis": 112.79}],
+        }
+        result = plan_orders(runtime_state, self._fixed_grid(), {"ALLOW_REANCHOR": False})
+        self.assertIn("buy_112_79", result["cancels"])
+        self.assertEqual(result["diagnostics"]["buys_suppressed_level_guard"], 1)
+
+    def test_price_improved_lot_suppresses_nearest_line(self):
+        """Buy price improvement (cost_basis 112.75) still attributes to nearest line 112.79."""
+        runtime_state = {
+            "symbol": "HOOD",
+            "current_price": 113.00,
+            "atr": 4.20,
+            "cash_available": 8000.0,
+            "shares_available": 1,
+            "open_orders": [],
+            "open_lots": [{"open_lot_id": "lot1", "quantity": 1, "cost_basis": 112.75}],
+        }
+        result = plan_orders(runtime_state, self._fixed_grid(), {"ALLOW_REANCHOR": False})
+        buy_prices = [p["limit_price"] for p in result["places"] if p["side"] == "buy"]
+        self.assertNotIn(112.79, buy_prices, "Price-improved lot should still suppress nearest line 112.79")
+        self.assertEqual(result["diagnostics"]["buys_suppressed_level_guard"], 1)
+
+    def test_lot_far_outside_grid_suppresses_nothing(self):
+        """A lot with cost basis far outside the grid band attributes to no line."""
+        runtime_state = {
+            "symbol": "HOOD",
+            "current_price": 113.00,
+            "atr": 4.20,
+            "cash_available": 8000.0,
+            "shares_available": 0,
+            "open_orders": [],
+            "open_lots": [{"open_lot_id": "lot1", "quantity": 100, "cost_basis": 90.00}],
+        }
+        result = plan_orders(runtime_state, self._fixed_grid(), {"ALLOW_REANCHOR": False})
+        buy_prices = [p["limit_price"] for p in result["places"] if p["side"] == "buy"]
+        self.assertIn(112.79, buy_prices, "Out-of-grid lot must not suppress any line")
+        self.assertEqual(result["diagnostics"]["buys_suppressed_level_guard"], 0)
+
+    def test_partial_holding_does_not_suppress(self):
+        """Held qty below the level's full desired qty must NOT suppress the buy."""
+        runtime_state = {
+            "symbol": "HOOD",
+            "current_price": 113.00,
+            "atr": 4.20,
+            "cash_available": 8000.0,
+            "shares_available": 1,
+            "open_orders": [],
+            "open_lots": [{"open_lot_id": "lot1", "quantity": 1, "cost_basis": 112.79}],
+        }
+        # lot_dollars=240 -> desired qty at 112.79 = floor(240/112.79) = 2; held=1 < 2
+        result = plan_orders(runtime_state, self._fixed_grid(lot_dollars=240.0), {"ALLOW_REANCHOR": False})
+        buys = {p["limit_price"]: p["quantity"] for p in result["places"] if p["side"] == "buy"}
+        self.assertIn(112.79, buys, "Partial holding must not suppress the buy")
+        self.assertEqual(buys[112.79], 2)
+        self.assertEqual(result["diagnostics"]["buys_suppressed_level_guard"], 0)
+
+    def test_no_open_lots_regression(self):
+        """Absent open_lots -> behavior identical to before; guard diagnostics stays at 0."""
+        runtime_state = {
+            "symbol": "HOOD",
+            "current_price": 113.00,
+            "atr": 4.20,
+            "cash_available": 8000.0,
+            "shares_available": 1,
+            "open_orders": [],
+        }
+        result = plan_orders(runtime_state, self._fixed_grid(), {"ALLOW_REANCHOR": False})
+        buy_prices = [p["limit_price"] for p in result["places"] if p["side"] == "buy"]
+        self.assertIn(112.79, buy_prices)
+        self.assertEqual(result["diagnostics"]["buys_suppressed_level_guard"], 0)
+
+    def test_multi_cycle_pileup_prevention(self):
+        """
+        ACCEPTANCE TEST: price oscillates around the 112.79 buy line for 6 hourly
+        cycles. Each time the 112.79 buy is placed it fills instantly (share held,
+        open_lot recorded); its paired sell never fills. Held shares at 112.79 must
+        never exceed the level's desired qty (1) — i.e. no pileup.
+        """
+        cash_available = 8000.0
+        shares_available = 0
+        open_orders = []
+        open_lots = []
+        next_id = 0
+
+        for cycle in range(6):
+            runtime_state = {
+                "symbol": "HOOD",
+                "current_price": 113.00,
+                "atr": 4.20,
+                "cash_available": cash_available,
+                "shares_available": shares_available,
+                "open_orders": open_orders,
+                "open_lots": open_lots,
+            }
+            result = plan_orders(runtime_state, self._fixed_grid(), {"ALLOW_REANCHOR": False})
+
+            cancel_ids = set(result["cancels"])
+            open_orders = [o for o in open_orders if o["order_id"] not in cancel_ids]
+
+            for p in result["places"]:
+                if p["side"] == "buy" and abs(p["limit_price"] - 112.79) < 1e-6:
+                    shares_available += p["quantity"]
+                    cash_available -= p["limit_price"] * p["quantity"]
+                    open_lots.append(
+                        {"open_lot_id": f"lot_{next_id}", "quantity": p["quantity"], "cost_basis": p["limit_price"]}
+                    )
+                    next_id += 1
+                else:
+                    open_orders.append(
+                        {
+                            "order_id": f"order_{next_id}",
+                            "side": p["side"],
+                            "limit_price": p["limit_price"],
+                            "quantity": p["quantity"],
+                            "state": "confirmed",
+                        }
+                    )
+                    next_id += 1
+
+            held_at_112_79 = sum(l["quantity"] for l in open_lots if abs(l["cost_basis"] - 112.79) < 1e-6)
+            self.assertLessEqual(
+                held_at_112_79,
+                1,
+                f"Cycle {cycle}: shares held at 112.79 exceeded desired qty (pileup bug)",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
