@@ -34,6 +34,7 @@ TIME_IN_FORCE = "gtc"
 MARKET_HOURS = "regular_hours"
 ALLOW_REANCHOR = True  # Cloud stateless deployment: set to False for fixed geometry mode
 BUFFER_LOTS = 2  # CHANGE D: number of lots to hold in buffer (settled cash buffer)
+MARKETABLE_EXIT_DISCOUNT = 0.10  # CHANGE H: discount below spot for marketable exits; MUST stay < STEP
 
 
 def _round_to_tick(price: float, tick: float = TICK) -> float:
@@ -219,7 +220,7 @@ def plan_orders(
     config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Core planning algorithm (v4 with CHANGE D/E/F).
+    Core planning algorithm (v4 with CHANGE D/E/F/H).
 
     Analyzes current account state and grid, returns a plan of order cancels and places.
 
@@ -236,7 +237,7 @@ def plan_orders(
       diagnostics: {step, lot_dollars, anchor, spot, num_buys, num_sells,
                     cash_budget_used, shares_budget_used, initialized_now, skipped_no_cash,
                     unsettled_cash, buffer_lots, buffer_dollars, lot_below_min_line,
-                    exits_deferred_below_spot, sells_frozen_no_lots, reanchored (always False),
+                    exits_marketable_below_spot, marketable_exit_price, sells_frozen_no_lots, reanchored (always False),
                     not_initialized, buys_suppressed_level_guard}
     """
     cfg = _get_config(config)
@@ -282,7 +283,8 @@ def plan_orders(
                     "buffer_lots": buffer_lots,
                     "buffer_dollars": 0.0,
                     "lot_below_min_line": False,
-                    "exits_deferred_below_spot": 0,
+                    "exits_marketable_below_spot": 0,
+                    "marketable_exit_price": None,
                     "sells_frozen_no_lots": False,
                     "reanchored": False,
                     "initialized_now": False,
@@ -313,7 +315,8 @@ def plan_orders(
                         "buffer_lots": buffer_lots,
                         "buffer_dollars": 0.0,
                         "lot_below_min_line": False,
-                        "exits_deferred_below_spot": 0,
+                        "exits_marketable_below_spot": 0,
+                        "marketable_exit_price": None,
                         "sells_frozen_no_lots": False,
                         "reanchored": False,
                         "initialized_now": False,
@@ -351,7 +354,8 @@ def plan_orders(
                 "buffer_lots": buffer_lots,
                 "buffer_dollars": 0.0,
                 "lot_below_min_line": False,
-                "exits_deferred_below_spot": 0,
+                "exits_marketable_below_spot": 0,
+                "marketable_exit_price": None,
                 "sells_frozen_no_lots": False,
                 "reanchored": False,
                 "initialized_now": initialized_now,
@@ -384,6 +388,21 @@ def plan_orders(
         for lot in open_lots:
             exit_price = round(lot["cost_basis"] + step, 2)
             desired_exits[exit_price] = desired_exits.get(exit_price, 0) + lot["quantity"]
+
+    # CHANGE H: Merge all below-spot exits into one marketable limit order
+    exits_marketable_below_spot = 0
+    marketable_exit_price = None
+    below_spot_exits = [p for p in desired_exits.keys() if p <= current_price]
+    if below_spot_exits:
+        marketable_price = round(current_price - MARKETABLE_EXIT_DISCOUNT, 2)
+        if marketable_price >= 0.01:
+            marketable_qty = sum(desired_exits[p] for p in below_spot_exits)
+            exits_marketable_below_spot = marketable_qty
+            marketable_exit_price = marketable_price
+            # Remove original below-spot entries and add merged one
+            for p in below_spot_exits:
+                del desired_exits[p]
+            desired_exits[marketable_price] = marketable_qty
 
     # Step 6: Match open orders to desired state
     kept_orders = {}
@@ -448,9 +467,9 @@ def plan_orders(
     available_for_buys = cash_available + cancelled_buy_cash
     available_for_sells = shares_available + cancelled_sell_shares
 
-    # Step 7: CHANGE E - Build sell places from desired exits
+    # Step 7: CHANGE E/H - Build sell places from desired exits
+    # (CHANGE H: no defer branch; below-spot exits already merged into one marketable order)
     sell_places = []
-    exits_deferred_below_spot = 0
 
     if not sells_frozen:
         # Place desired exits (in ascending price order, nearest first)
@@ -458,11 +477,6 @@ def plan_orders(
         for exit_price in sorted(desired_exits.keys()):
             if exit_price in prices_with_kept_sells:
                 continue  # already have order at this price
-
-            # CHANGE E: Defer exits <= spot (would be market orders)
-            if exit_price <= current_price:
-                exits_deferred_below_spot += desired_exits[exit_price]
-                continue
 
             desired_qty = desired_exits[exit_price]
             if desired_qty <= remaining_sell_shares:
@@ -542,7 +556,8 @@ def plan_orders(
             "buffer_lots": buffer_lots,
             "buffer_dollars": buffer_dollars,
             "lot_below_min_line": lot_below_min_line,
-            "exits_deferred_below_spot": exits_deferred_below_spot,
+            "exits_marketable_below_spot": exits_marketable_below_spot,
+            "marketable_exit_price": marketable_exit_price,
             "sells_frozen_no_lots": sells_frozen,
             "reanchored": False,  # CHANGE F: never reanchors (vestigial for compat)
             "initialized_now": initialized_now,

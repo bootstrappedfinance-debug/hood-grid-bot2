@@ -1201,11 +1201,11 @@ class TestChangeDefAndFV4Regression(unittest.TestCase):
         self.assertEqual(len(sell_places), 0, "No new sell places when frozen")
         self.assertTrue(result["diagnostics"]["sells_frozen_no_lots"])
 
-    def test_6_exit_deferred_below_spot(self):
-        """Exits with price <= spot are deferred."""
+    def test_6_exit_below_spot_marketable(self):
+        """CHANGE H: Exits with price <= spot are merged into one marketable sell at spot - 0.10."""
         grid_state = {"anchor": 100.00, "step": 0.48, "initialized": True}
 
-        # Part A: spot=105, exit @100.48 is below spot → deferred
+        # Part A: spot=105, exit @100.48 is below spot → merged into marketable at 104.90
         runtime_state = {
             "symbol": "HOOD", "current_price": 105.00, "atr": 1.0,
             "cash_available": 8000.0, "shares_available": 1,
@@ -1216,15 +1216,20 @@ class TestChangeDefAndFV4Regression(unittest.TestCase):
         }
         result = plan_orders(runtime_state, grid_state)
         sell_places = [p for p in result["places"] if p["side"] == "sell"]
-        self.assertEqual(len(sell_places), 0, "No sell at 100.48 when spot=105")
-        self.assertGreaterEqual(result["diagnostics"]["exits_deferred_below_spot"], 1)
+        self.assertEqual(len(sell_places), 1, "Should have one marketable sell at 104.90 when spot=105")
+        self.assertAlmostEqual(sell_places[0]["limit_price"], 104.90, places=2)
+        self.assertEqual(sell_places[0]["quantity"], 1)
+        self.assertEqual(result["diagnostics"]["exits_marketable_below_spot"], 1)
+        self.assertAlmostEqual(result["diagnostics"]["marketable_exit_price"], 104.90, places=2)
 
-        # Part B: spot=99, exit @100.48 is above spot → placed
+        # Part B: spot=99, exit @100.48 is above spot → placed as normal exit
         runtime_state["current_price"] = 99.00
         result = plan_orders(runtime_state, grid_state)
         sell_places = [p for p in result["places"] if p["side"] == "sell"]
         self.assertEqual(len(sell_places), 1, "Should have sell @100.48 when spot=99")
         self.assertAlmostEqual(sell_places[0]["limit_price"], 100.48, places=2)
+        self.assertEqual(result["diagnostics"]["exits_marketable_below_spot"], 0)
+        self.assertIsNone(result["diagnostics"]["marketable_exit_price"])
 
     def test_7_buffer_accounting(self):
         """Buffer accounting: buffer_dollars = buffer_lots * lot_dollars."""

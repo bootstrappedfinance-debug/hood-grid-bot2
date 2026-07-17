@@ -400,7 +400,7 @@ class TestCloudReconcilerDirectAssertions(unittest.TestCase):
                 self.assertLess(p["limit_price"], 115.19, f"Buy at {p['limit_price']} >= spot 115.19")
 
     def test_no_sell_at_or_below_spot(self):
-        """Invariant: no sell price <= spot."""
+        """Invariant: every sell has limit_price > spot EXCEPT at most one marketable order at round(spot - 0.10, 2)."""
         runtime_state = {
             "symbol": "HOOD",
             "current_price": 115.19,
@@ -410,9 +410,15 @@ class TestCloudReconcilerDirectAssertions(unittest.TestCase):
             "open_orders": [],
         }
         result = cloud_reconcile(runtime_state, ANCHOR, STEP, LOT_DOLLARS)
+        marketable_price = round(115.19 - 0.10, 2)
+        marketable_count = 0
         for p in result["places"]:
             if p["side"] == "sell":
-                self.assertGreater(p["limit_price"], 115.19, f"Sell at {p['limit_price']} <= spot 115.19")
+                if p["limit_price"] == marketable_price:
+                    marketable_count += 1
+                else:
+                    self.assertGreater(p["limit_price"], 115.19, f"Sell at {p['limit_price']} <= spot 115.19 and not marketable")
+        self.assertLessEqual(marketable_count, 1, f"More than one marketable sell at {marketable_price}")
 
     def test_quantities_positive_ints(self):
         """All quantities are positive integers."""
@@ -1061,9 +1067,9 @@ class TestChangeDefAndFV4Regression(unittest.TestCase):
         self.assertEqual(len(sell_places), 0, "No new sell places when frozen")
         self.assertTrue(result["diagnostics"]["sells_frozen_no_lots"])
 
-    def test_6_exit_deferred_below_spot(self):
-        """Exits with price <= spot are deferred."""
-        # Part A: spot=105, exit @100.48 is below spot → deferred
+    def test_6_exit_below_spot_marketable(self):
+        """CHANGE H: Exits with price <= spot are merged into one marketable sell at spot - 0.10."""
+        # Part A: spot=105, exit @100.48 is below spot → merged into marketable at 104.90
         runtime_state = {
             "symbol": "HOOD", "current_price": 105.00, "atr": 1.0,
             "cash_available": 8000.0, "shares_available": 1,
@@ -1074,15 +1080,20 @@ class TestChangeDefAndFV4Regression(unittest.TestCase):
         }
         result = cloud_reconcile(runtime_state, anchor=100.00, step=0.48)
         sell_places = [p for p in result["places"] if p["side"] == "sell"]
-        self.assertEqual(len(sell_places), 0, "No sell at 100.48 when spot=105")
-        self.assertGreaterEqual(result["diagnostics"]["exits_deferred_below_spot"], 1)
+        self.assertEqual(len(sell_places), 1, "Should have one marketable sell at 104.90 when spot=105")
+        self.assertAlmostEqual(sell_places[0]["limit_price"], 104.90, places=2)
+        self.assertEqual(sell_places[0]["quantity"], 1)
+        self.assertEqual(result["diagnostics"]["exits_marketable_below_spot"], 1)
+        self.assertAlmostEqual(result["diagnostics"]["marketable_exit_price"], 104.90, places=2)
 
-        # Part B: spot=99, exit @100.48 is above spot → placed
+        # Part B: spot=99, exit @100.48 is above spot → placed as normal exit
         runtime_state["current_price"] = 99.00
         result = cloud_reconcile(runtime_state, anchor=100.00, step=0.48)
         sell_places = [p for p in result["places"] if p["side"] == "sell"]
         self.assertEqual(len(sell_places), 1, "Should have sell @100.48 when spot=99")
         self.assertAlmostEqual(sell_places[0]["limit_price"], 100.48, places=2)
+        self.assertEqual(result["diagnostics"]["exits_marketable_below_spot"], 0)
+        self.assertIsNone(result["diagnostics"]["marketable_exit_price"])
 
     def test_7_buffer_accounting(self):
         """Buffer accounting: buffer_dollars = buffer_lots * lot_dollars."""
@@ -1132,6 +1143,114 @@ class TestChangeDefAndFV4Regression(unittest.TestCase):
         result2 = cloud_reconcile(runtime_state, anchor=115.19, step=0.48)
         self.assertEqual(len(result2["cancels"]), 0)
         self.assertEqual(len(result2["places"]), 0)
+
+
+class TestMarketableExits(unittest.TestCase):
+    """CHANGE H: Test marketable exits (merged below-spot sells)."""
+
+    def test_below_spot_exits_merge_into_one_marketable_sell(self):
+        """Multiple 1-share lots all with cost+step <= spot merge into one marketable sell."""
+        # spot 101.91, lots at costs 98.39/98.87/99.35/99.83 (exits at 98.87/99.35/99.83/100.31, all <= 101.91)
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 101.91, "atr": 1.0,
+            "cash_available": 5000.0, "shares_available": 4,
+            "open_orders": [],
+            "open_lots": [
+                {"open_lot_id": "lot1", "quantity": 1, "cost_basis": 98.39},
+                {"open_lot_id": "lot2", "quantity": 1, "cost_basis": 98.87},
+                {"open_lot_id": "lot3", "quantity": 1, "cost_basis": 99.35},
+                {"open_lot_id": "lot4", "quantity": 1, "cost_basis": 99.83},
+            ],
+        }
+        result = cloud_reconcile(runtime_state, anchor=100.00, step=0.48)
+        sell_places = [p for p in result["places"] if p["side"] == "sell"]
+        # All 4 exits should merge into one at 101.81
+        self.assertEqual(len(sell_places), 1, "Should have exactly one marketable sell")
+        self.assertAlmostEqual(sell_places[0]["limit_price"], 101.81, places=2)
+        self.assertEqual(sell_places[0]["quantity"], 4)
+        self.assertEqual(result["diagnostics"]["exits_marketable_below_spot"], 4)
+        self.assertAlmostEqual(result["diagnostics"]["marketable_exit_price"], 101.81, places=2)
+
+    def test_mixed_below_and_above_spot(self):
+        """Lots with exits both below and above spot produce one marketable + normal exits."""
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 101.00, "atr": 1.0,
+            "cash_available": 5000.0, "shares_available": 3,
+            "open_orders": [],
+            "open_lots": [
+                {"open_lot_id": "lot1", "quantity": 1, "cost_basis": 99.00},  # exit 99.48 < 101.00 → marketable
+                {"open_lot_id": "lot2", "quantity": 1, "cost_basis": 101.50},  # exit 101.98 > 101.00 → normal
+                {"open_lot_id": "lot3", "quantity": 1, "cost_basis": 102.00},  # exit 102.48 > 101.00 → normal
+            ],
+        }
+        result = cloud_reconcile(runtime_state, anchor=100.00, step=0.48)
+        sell_places = [p for p in result["places"] if p["side"] == "sell"]
+        # Should have 3 sells: one marketable at 100.90, and two normal at 101.98 and 102.48
+        self.assertEqual(len(sell_places), 3, "Should have 3 sells (1 marketable + 2 normal)")
+        # Sort by price to check them
+        sell_places_sorted = sorted(sell_places, key=lambda x: x["limit_price"])
+        self.assertAlmostEqual(sell_places_sorted[0]["limit_price"], 100.90, places=2)
+        self.assertEqual(sell_places_sorted[0]["quantity"], 1)
+        self.assertAlmostEqual(sell_places_sorted[1]["limit_price"], 101.98, places=2)
+        self.assertAlmostEqual(sell_places_sorted[2]["limit_price"], 102.48, places=2)
+        self.assertEqual(result["diagnostics"]["exits_marketable_below_spot"], 1)
+
+    def test_existing_marketable_order_kept(self):
+        """Existing marketable order at exactly (round(spot-0.10, 2), qty) is kept."""
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 101.00, "atr": 1.0,
+            "cash_available": 5000.0, "shares_available": 2,
+            "open_orders": [
+                {"order_id": "sell1", "side": "sell", "limit_price": 100.90, "quantity": 1},
+            ],
+            "open_lots": [
+                {"open_lot_id": "lot1", "quantity": 1, "cost_basis": 99.00},  # exit 99.48 → marketable at 100.90
+            ],
+        }
+        result = cloud_reconcile(runtime_state, anchor=100.00, step=0.48)
+        # The existing order at 100.90 should be kept (not cancelled)
+        self.assertNotIn("sell1", result["cancels"], "Existing marketable order should not be cancelled")
+        sell_places = [p for p in result["places"] if p["side"] == "sell"]
+        # Should not place a duplicate at 100.90
+        self.assertEqual(len([p for p in sell_places if abs(p["limit_price"] - 100.90) < 0.01]), 0,
+                        "Should not place duplicate marketable sell")
+
+    def test_marketable_never_below_cost(self):
+        """Marketable exit price is always > cost_basis (discount < step)."""
+        # boundary case: cost_basis = spot - step exactly, so exit = spot
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 100.00, "atr": 1.0,
+            "cash_available": 5000.0, "shares_available": 1,
+            "open_orders": [],
+            "open_lots": [
+                {"open_lot_id": "lot1", "quantity": 1, "cost_basis": 99.52},  # exit = 100.00 = spot
+            ],
+        }
+        result = cloud_reconcile(runtime_state, anchor=100.00, step=0.48)
+        marketable_price = result["diagnostics"]["marketable_exit_price"]
+        self.assertIsNotNone(marketable_price, "Should have marketable exit")
+        self.assertGreater(marketable_price, 99.52, "Marketable price must be > cost_basis")
+        # With spot 100.00 and discount 0.10, marketable should be 99.90
+        self.assertAlmostEqual(marketable_price, 99.90, places=2)
+
+    def test_shares_budget_priority(self):
+        """Marketable sell is placed before higher-priced exits when shares_budget is limited."""
+        runtime_state = {
+            "symbol": "HOOD", "current_price": 101.50, "atr": 1.0,
+            "cash_available": 5000.0, "shares_available": 1,  # Only 1 share available
+            "open_orders": [],
+            "open_lots": [
+                {"open_lot_id": "lot1", "quantity": 1, "cost_basis": 99.00},  # exit 99.48 → marketable at 101.40
+                {"open_lot_id": "lot2", "quantity": 1, "cost_basis": 101.50},  # exit 101.98 > 101.50 → normal (not merged)
+            ],
+        }
+        result = cloud_reconcile(runtime_state, anchor=100.00, step=0.48)
+        sell_places = [p for p in result["places"] if p["side"] == "sell"]
+        # With only 1 share, marketable should get placed first (ascending price order, and gets priority over higher-priced)
+        self.assertEqual(len(sell_places), 1, "Should place only 1 sell: marketable at 101.40")
+        self.assertAlmostEqual(sell_places[0]["limit_price"], 101.40, places=2)
+        self.assertEqual(sell_places[0]["quantity"], 1)
+        self.assertEqual(result["diagnostics"]["exits_marketable_below_spot"], 1)
 
 
 if __name__ == "__main__":

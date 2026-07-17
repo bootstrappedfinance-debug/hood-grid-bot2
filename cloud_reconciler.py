@@ -8,6 +8,7 @@ Produces plans identical to grid_engine.py in ALLOW_REANCHOR=False mode.
 Enhancements:
 - CHANGE A: Dynamic lot sizing from equity (cost-basis + cash)
 - CHANGE G (v5): Sells are standard limit orders — tax-lot designation removed (designated orders could be rejected for unselectable lots, leaving no standing sell)
+- CHANGE H (v6): exits overtaken by price (exit <= spot) are not deferred; they merge into one marketable limit sell at spot - 0.10 so the shares exit immediately
 
 Use: python3 cloud_reconciler.py --state-file runtime.json [--out plan.json] [--anchor A --step S --lot L]
 """
@@ -27,6 +28,7 @@ TICK = 0.01
 TIME_IN_FORCE = "gtc"
 MARKET_HOURS = "regular_hours"
 BUFFER_LOTS = 2  # CHANGE D: number of lots to hold in buffer
+MARKETABLE_EXIT_DISCOUNT = 0.10  # CHANGE H: discount below spot for marketable exits; MUST stay < STEP (guarantees marketable exits never sell below a lot's cost: exit <= spot implies cost + step <= spot, so spot - discount >= cost + step - discount > cost)
 
 
 def floor(x):
@@ -118,7 +120,7 @@ def compute_dynamic_lot(runtime_state, num_levels=NUM_LEVELS, buffer_lots=BUFFER
 
 def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels=NUM_LEVELS, buffer_lots=BUFFER_LOTS, tick=TICK):
     """
-    Core reconciliation logic (v5 with CHANGE D/E/F/G).
+    Core reconciliation logic (v6 with CHANGE D/E/F/G/H).
 
     Input: {symbol, current_price, cash_available, shares_available, open_orders, average_cost?, open_lots?, cash_total?}
     Output: {cancels, places, diagnostics}
@@ -163,7 +165,8 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
                 "buffer_lots": buffer_lots,
                 "buffer_dollars": 0.0,
                 "lot_below_min_line": False,
-                "exits_deferred_below_spot": 0,
+                "exits_marketable_below_spot": 0,
+                "marketable_exit_price": None,
                 "sells_frozen_no_lots": False,
                 "buys_suppressed_level_guard": 0,
             },
@@ -189,6 +192,21 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
         for lot in open_lots:
             exit_price = round(lot["cost_basis"] + step, 2)
             desired_exits[exit_price] = desired_exits.get(exit_price, 0) + lot["quantity"]
+
+    # CHANGE H: Merge all below-spot exits into one marketable limit order
+    exits_marketable_below_spot = 0
+    marketable_exit_price = None
+    below_spot_exits = [p for p in desired_exits.keys() if p <= current_price]
+    if below_spot_exits:
+        marketable_price = round(current_price - MARKETABLE_EXIT_DISCOUNT, 2)
+        if marketable_price >= 0.01:
+            marketable_qty = sum(desired_exits[p] for p in below_spot_exits)
+            exits_marketable_below_spot = marketable_qty
+            marketable_exit_price = marketable_price
+            # Remove original below-spot entries and add merged one
+            for p in below_spot_exits:
+                del desired_exits[p]
+            desired_exits[marketable_price] = marketable_qty
 
     # CHANGE C: one-lot-per-level buy guard (attribute held shares to grid lines)
     held_at_line = held_shares_by_line(open_lots, anchor, step, num_levels)
@@ -282,9 +300,9 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
         else:
             break
 
-    # CHANGE E: Build sell places from desired exits
+    # CHANGE E/H: Build sell places from desired exits
+    # (CHANGE H: no defer branch; below-spot exits already merged into one marketable order)
     sell_places = []
-    exits_deferred_below_spot = 0
 
     if not sells_frozen:
         # Place desired exits (in ascending price order, nearest first)
@@ -292,11 +310,6 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
         for exit_price in sorted(desired_exits.keys()):
             if exit_price in prices_with_kept_sells:
                 continue  # already have order at this price
-
-            # CHANGE E: Defer exits <= spot (would be market orders)
-            if exit_price <= current_price:
-                exits_deferred_below_spot += desired_exits[exit_price]
-                continue
 
             desired_qty_at_price = desired_exits[exit_price]
             if desired_qty_at_price <= remaining_shares:
@@ -341,7 +354,8 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
         "buffer_lots": buffer_lots,
         "buffer_dollars": buffer_dollars,
         "lot_below_min_line": lot_below_min_line,
-        "exits_deferred_below_spot": exits_deferred_below_spot,
+        "exits_marketable_below_spot": exits_marketable_below_spot,
+        "marketable_exit_price": marketable_exit_price,
         "sells_frozen_no_lots": sells_frozen,
     }
 
