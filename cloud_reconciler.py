@@ -7,7 +7,7 @@ Produces plans identical to grid_engine.py in ALLOW_REANCHOR=False mode.
 
 Enhancements:
 - CHANGE A: Dynamic lot sizing from equity (cost-basis + cash)
-- CHANGE B: Specified-lot selling (tax_lots) for tax-aware order fulfillment
+- CHANGE G (v5): Sells are standard limit orders — tax-lot designation removed (designated orders could be rejected for unselectable lots, leaving no standing sell)
 
 Use: python3 cloud_reconciler.py --state-file runtime.json [--out plan.json] [--anchor A --step S --lot L]
 """
@@ -116,121 +116,9 @@ def compute_dynamic_lot(runtime_state, num_levels=NUM_LEVELS, buffer_lots=BUFFER
     return lot_dollars, equity_at_cost, total_shares, share_val, unsettled
 
 
-def assign_tax_lots_for_exits(sell_places, open_lots, step):
-    """
-    CHANGE E: Assign tax lots to sell orders for lot-based exits.
-
-    Rework of CHANGE B: only lots with is_selectable == True may be designated.
-
-    Modifies sell_places in-place to add tax_lots field (if possible).
-    Returns sell_fifo_fallback count and consumed_from_lots dict.
-
-    Tax lot priority for fallback (when generating lots unavailable):
-    1. GAIN lots (cost_basis < sell_price) first
-    2. Within GAIN: highest cost_basis first (nearest below, smallest gain realized)
-    3. LOSS lots (cost_basis >= sell_price) second
-    4. Within LOSS: lowest cost_basis first (nearest above, smallest loss realized)
-    Restricted to lots with is_selectable == True.
-    """
-    sell_fifo_fallback = 0
-    consumed_from_lots = {}  # {open_lot_id: consumed_qty}
-
-    # Sort sell_places by price (ascending) for deterministic assignment
-    sell_places_sorted = sorted(
-        [(i, p) for i, p in enumerate(sell_places) if p["side"] == "sell"],
-        key=lambda x: x[1]["limit_price"],
-    )
-
-    for place_idx, sell_place in sell_places_sorted:
-        sell_price = sell_place["limit_price"]
-        sell_qty = sell_place["quantity"]
-
-        # CHANGE E: First, try to use lots that generated this exit (cost_basis + step == sell_price)
-        generating_lots = []
-        for lot in open_lots:
-            if not lot.get("is_selectable", False):
-                continue  # CHANGE E: only selectable lots
-            if round(lot["cost_basis"] + step, 2) == sell_price:
-                lot_id = lot["open_lot_id"]
-                total_qty = lot["quantity"]
-                consumed = consumed_from_lots.get(lot_id, 0)
-                remaining = total_qty - consumed
-                if remaining > 0:
-                    generating_lots.append((lot_id, remaining))
-
-        # If generating lots fully cover, use them
-        if generating_lots:
-            total_available = sum(q for _, q in generating_lots)
-            if total_available >= sell_qty:
-                tax_lots = []
-                still_needed = sell_qty
-                tentative_consumed = {}
-                for lot_id, remaining in generating_lots:
-                    if still_needed <= 0:
-                        break
-                    take_qty = min(remaining, still_needed)
-                    tax_lots.append({"open_lot_id": lot_id, "quantity": take_qty})
-                    tentative_consumed[lot_id] = take_qty
-                    still_needed -= take_qty
-
-                if still_needed <= 0:
-                    for lot_id, qty in tentative_consumed.items():
-                        consumed_from_lots[lot_id] = consumed_from_lots.get(lot_id, 0) + qty
-                    sell_place["tax_lots"] = tax_lots
-                    continue
-
-        # Fallback: gain-preferring selection from selectable lots
-        candidates = []
-        for lot in open_lots:
-            if not lot.get("is_selectable", False):
-                continue  # CHANGE E: only selectable lots
-            lot_id = lot["open_lot_id"]
-            total_qty = lot["quantity"]
-            consumed = consumed_from_lots.get(lot_id, 0)
-            remaining = total_qty - consumed
-            if remaining > 0:
-                cost_basis = lot["cost_basis"]
-                is_loss = 0 if cost_basis < sell_price else 1
-                sort_cost = -cost_basis if is_loss == 0 else cost_basis
-                candidates.append((is_loss, sort_cost, lot_id, cost_basis, remaining))
-
-        if not candidates:
-            # No selectable lots available; use FIFO fallback
-            sell_fifo_fallback += 1
-            continue
-
-        # Sort candidates by (is_loss, sort_cost, lot_id)
-        candidates.sort()
-
-        # Greedily assign lots
-        tax_lots = []
-        still_needed = sell_qty
-        tentative_consumed = {}
-
-        for is_loss, sort_cost, lot_id, cost_basis, remaining in candidates:
-            if still_needed <= 0:
-                break
-            take_qty = min(remaining, still_needed)
-            tax_lots.append({"open_lot_id": lot_id, "quantity": take_qty})
-            tentative_consumed[lot_id] = take_qty
-            still_needed -= take_qty
-
-            if len(tax_lots) >= 30:
-                break
-
-        if still_needed <= 0:
-            for lot_id, qty in tentative_consumed.items():
-                consumed_from_lots[lot_id] = consumed_from_lots.get(lot_id, 0) + qty
-            sell_place["tax_lots"] = tax_lots
-        else:
-            sell_fifo_fallback += 1
-
-    return sell_fifo_fallback, consumed_from_lots
-
-
 def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels=NUM_LEVELS, buffer_lots=BUFFER_LOTS, tick=TICK):
     """
-    Core reconciliation logic (v4 with CHANGE D/E/F).
+    Core reconciliation logic (v5 with CHANGE D/E/F/G).
 
     Input: {symbol, current_price, cash_available, shares_available, open_orders, average_cost?, open_lots?, cash_total?}
     Output: {cancels, places, diagnostics}
@@ -425,11 +313,6 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
 
     places = buy_places + sell_places
 
-    # CHANGE E: Assign tax lots to sell orders (updated for is_selectable)
-    sell_fifo_fallback = 0
-    if open_lots and sell_places:
-        sell_fifo_fallback, _ = assign_tax_lots_for_exits(places, open_lots, step)
-
     # Diagnostics
     num_buys = len(buy_places)
     num_sells = len(sell_places)
@@ -468,9 +351,8 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
         diag["total_shares"] = int(total_shares) if total_shares == int(total_shares) else total_shares
         diag["avg_cost_used"] = round(avg_cost_used, 2) if avg_cost_used else None
 
-    # Add tax lot fallback count and CHANGE C level-guard suppression count
+    # Add CHANGE C level-guard suppression count
     if open_lots:
-        diag["sell_fifo_fallback"] = sell_fifo_fallback
         diag["buys_suppressed_level_guard"] = len(suppressed_lines)
 
     return {

@@ -252,7 +252,7 @@ def plan_orders(
     cash_available = runtime_state["cash_available"]
     shares_available = runtime_state["shares_available"]
     open_orders = runtime_state.get("open_orders", [])
-    open_lots = runtime_state.get("open_lots", [])  # CHANGE D: with is_selectable; CHANGE E: for exits
+    open_lots = runtime_state.get("open_lots", [])  # CHANGE E: for exits
 
     # Copy grid_state so we can mutate it
     gs = dict(grid_state) if grid_state else {}

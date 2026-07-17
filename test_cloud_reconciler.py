@@ -587,223 +587,118 @@ class TestDynamicLotSizing(unittest.TestCase):
             self.assertEqual(p1["quantity"], p2["quantity"])
 
 
-class TestSpecifiedLotSelling(unittest.TestCase):
-    """CHANGE B: Specified-lot selling (tax_lots)."""
+class TestStandardSells(unittest.TestCase):
+    """CHANGE G (v5): Standard sell orders without tax-lot designation."""
 
-    def test_tax_lots_basic_assignment(self):
-        """Basic tax lot assignment to sell orders."""
-        # Use fixed lot and only shares (no cash for buys)
+    def test_no_tax_lots_field_ever(self):
+        """No place (buy or sell) should ever carry a tax_lots field, and no sell_fifo_fallback diagnostic."""
+        # Build a state with several open_lots (mix of is_selectable True and False, cost bases around grid)
         runtime_state = {
             "symbol": "HOOD",
-            "current_price": 115.19,
+            "current_price": 112.50,
             "atr": 4.20,
-            "cash_available": 0.0,  # No cash for buys
-            "shares_available": 50,  # Plenty of shares
+            "cash_available": 2000.0,
+            "shares_available": 5,
             "open_lots": [
-                {"open_lot_id": "lot1", "quantity": 30, "cost_basis": 110.00},
-                {"open_lot_id": "lot2", "quantity": 20, "cost_basis": 112.00},
+                {"open_lot_id": "lot_sel_1", "quantity": 1, "cost_basis": 111.35, "is_selectable": True},
+                {"open_lot_id": "lot_no_sel_1", "quantity": 1, "cost_basis": 111.83, "is_selectable": False},
+                {"open_lot_id": "lot_sel_2", "quantity": 1, "cost_basis": 112.31, "is_selectable": True},
+                {"open_lot_id": "lot_no_sel_2", "quantity": 1, "cost_basis": 112.79, "is_selectable": False},
+                {"open_lot_id": "lot_sel_3", "quantity": 1, "cost_basis": 113.27, "is_selectable": True},
             ],
             "open_orders": [],
         }
-        result = cloud_reconcile(runtime_state, ANCHOR, STEP, lot_dollars_override=LOT_DOLLARS)
+        result = cloud_reconcile(runtime_state, ANCHOR, STEP)
 
-        # Extract sell orders (should have plenty)
-        sells = [p for p in result["places"] if p["side"] == "sell"]
-        if len(sells) > 0:
-            # Check that sells with tax_lots sum correctly
-            for sell in sells:
-                if "tax_lots" in sell:
-                    # tax_lots should sum to sell quantity
-                    tax_qty = sum(t["quantity"] for t in sell["tax_lots"])
-                    self.assertEqual(tax_qty, sell["quantity"], f"Tax lots qty mismatch for {sell}")
-        # If no sells generated, that's ok - test the logic that does exist
-        self.assertGreaterEqual(len(result["places"]), 0)
+        # Assert no place carries tax_lots
+        for place in result["places"]:
+            self.assertNotIn("tax_lots", place, f"Place {place} should not carry tax_lots")
 
-    def test_tax_lots_prefer_gain_over_loss(self):
-        """Tax lots should prefer GAIN lots first, then LOSS lots within nearest selection."""
-        # This is verified implicitly by test_tax_lots_no_loss_scenario which shows
-        # that in an all-LOSS scenario, the nearest (lowest-cost) LOSS is selected.
-        # The sorting key prioritizes GAIN over LOSS, so with mixed lots, GAINs come first.
-        # Test passes by verifying all-LOSS scenario picks correctly (proves sorting works).
+        # Assert sell_fifo_fallback not in diagnostics
+        self.assertNotIn("sell_fifo_fallback", result["diagnostics"],
+                         "Diagnostics should not contain sell_fifo_fallback")
+
+    def test_sells_placed_for_unselectable_lots(self):
+        """Sell orders must be placed for unselectable (same-day) lots at cost_basis + step."""
+        # All open_lots have is_selectable False (same-day buys)
+        # shares_available equal to total lot qty, spot below the lots' exit prices
         runtime_state = {
             "symbol": "HOOD",
-            "current_price": 110.00,
+            "current_price": 110.50,  # Below all lot exit prices
             "atr": 4.20,
-            "cash_available": 0.0,
-            "shares_available": 50,
+            "cash_available": 1000.0,
+            "shares_available": 5,  # Equal to total lot qty (5 x 1)
             "open_lots": [
-                {"open_lot_id": "loss_high", "quantity": 10, "cost_basis": 120.00},  # All LOSS
-                {"open_lot_id": "loss_low", "quantity": 10, "cost_basis": 112.00},   # Nearest LOSS
-                {"open_lot_id": "loss_mid", "quantity": 10, "cost_basis": 115.00},
+                {"open_lot_id": "lot1", "quantity": 1, "cost_basis": 111.35, "is_selectable": False},
+                {"open_lot_id": "lot2", "quantity": 1, "cost_basis": 111.83, "is_selectable": False},
+                {"open_lot_id": "lot3", "quantity": 1, "cost_basis": 112.31, "is_selectable": False},
+                {"open_lot_id": "lot4", "quantity": 1, "cost_basis": 112.79, "is_selectable": False},
+                {"open_lot_id": "lot5", "quantity": 1, "cost_basis": 113.27, "is_selectable": False},
             ],
             "open_orders": [],
         }
-        result = cloud_reconcile(runtime_state, ANCHOR, STEP, lot_dollars_override=LOT_DOLLARS)
+        result = cloud_reconcile(runtime_state, ANCHOR, STEP)
 
+        # Extract sell places
         sells = [p for p in result["places"] if p["side"] == "sell"]
-        # If any sell has tax_lots, it should use loss_low (nearest to spot, lowest cost)
+
+        # Should have sell places at cost_basis + step for each lot
+        # Expected exits: 111.83, 112.31, 112.79, 113.27, 113.75
+        expected_exits = {111.83, 112.31, 112.79, 113.27, 113.75}
+        actual_exits = {round(s["limit_price"], 2) for s in sells}
+
+        # With spot 110.50 (below all exits) and 5 available shares, ALL five exits must be placed
+        self.assertEqual(actual_exits, expected_exits, "All five exits must be placed for unselectable lots")
+        # Each sell should be for 1 share
         for sell in sells:
-            if "tax_lots" in sell and len(sell["tax_lots"]) > 0:
-                first_lot = sell["tax_lots"][0]["open_lot_id"]
-                # Should use loss_low (cost 112, nearest above spot 110)
-                # not loss_high (cost 120, farthest)
-                self.assertNotEqual(first_lot, "loss_high", "Should not use farthest-cost LOSS lot first")
+            self.assertEqual(sell["quantity"], 1, f"Sell at {sell['limit_price']} should have quantity 1")
+            self.assertNotIn("tax_lots", sell, "Sell should not have tax_lots field")
 
-    def test_tax_lots_insufficient_coverage_fifo_fallback(self):
-        """If lots can't cover qty, set sell_fifo_fallback and omit tax_lots."""
+    def test_exit_prices_and_quantities_unchanged(self):
+        """Exit prices and quantities must match pre-change behavior (cost_basis + step, aggregated by price)."""
+        # 5 one-share lots at distinct cost bases, spaced by step (0.48) around ~112
         runtime_state = {
             "symbol": "HOOD",
-            "current_price": 115.19,
+            "current_price": 111.00,
             "atr": 4.20,
-            "cash_available": 0.0,
-            "shares_available": 5,  # Limited shares
+            "cash_available": 1000.0,
+            "shares_available": 5,
             "open_lots": [
-                {"open_lot_id": "lot1", "quantity": 2, "cost_basis": 110.00},
-                # Only 2 shares available, but we'll try to sell more
+                {"open_lot_id": "lot1", "quantity": 1, "cost_basis": 111.35, "is_selectable": False},
+                {"open_lot_id": "lot2", "quantity": 1, "cost_basis": 111.83, "is_selectable": True},
+                {"open_lot_id": "lot3", "quantity": 1, "cost_basis": 112.31, "is_selectable": False},
+                {"open_lot_id": "lot4", "quantity": 1, "cost_basis": 112.79, "is_selectable": True},
+                {"open_lot_id": "lot5", "quantity": 1, "cost_basis": 113.27, "is_selectable": False},
             ],
             "open_orders": [],
         }
-        result = cloud_reconcile(runtime_state, ANCHOR, STEP, LOT_DOLLARS)
+        result = cloud_reconcile(runtime_state, ANCHOR, STEP)
 
-        # Check diagnostics for fallback count
-        if "sell_fifo_fallback" in result["diagnostics"]:
-            # If there are sells that couldn't be fully covered by lots
-            fallback_count = result["diagnostics"]["sell_fifo_fallback"]
-            # Fallback count should reflect any sells without full lot coverage
-            self.assertGreaterEqual(fallback_count, 0)
-
-    def test_tax_lots_no_loss_scenario(self):
-        """All cost basis above sale price -> still assigns (nearest = lowest cost)."""
-        runtime_state = {
-            "symbol": "HOOD",
-            "current_price": 100.00,  # Low price
-            "atr": 4.20,
-            "cash_available": 0.0,
-            "shares_available": 0,
-            "open_lots": [
-                {"open_lot_id": "lot1", "quantity": 5, "cost_basis": 115.00},
-                {"open_lot_id": "lot2", "quantity": 5, "cost_basis": 120.00},
-            ],
-            "open_orders": [],
-        }
-        result = cloud_reconcile(runtime_state, ANCHOR, STEP, LOT_DOLLARS)
-
-        # Sells below the high cost basis should assign the lowest-cost lot
         sells = [p for p in result["places"] if p["side"] == "sell"]
+
+        # Expected exits (cost_basis + step = cost_basis + 0.48):
+        # 111.35 + 0.48 = 111.83
+        # 111.83 + 0.48 = 112.31
+        # 112.31 + 0.48 = 112.79
+        # 112.79 + 0.48 = 113.27
+        # 113.27 + 0.48 = 113.75
+        expected_exit_map = {
+            111.83: 1,
+            112.31: 1,
+            112.79: 1,
+            113.27: 1,
+            113.75: 1,
+        }
+
+        actual_exit_map = {}
         for sell in sells:
-            if "tax_lots" in sell:
-                # Should start with lot1 (115 is lower than 120)
-                first_lot_id = sell["tax_lots"][0]["open_lot_id"]
-                self.assertEqual(first_lot_id, "lot1", "Should prefer lower cost even in loss scenario")
+            price = round(sell["limit_price"], 2)
+            qty = sell["quantity"]
+            actual_exit_map[price] = actual_exit_map.get(price, 0) + qty
 
-    def test_tax_lots_buy_orders_never_have_tax_lots(self):
-        """Buy orders should never have tax_lots field."""
-        runtime_state = {
-            "symbol": "HOOD",
-            "current_price": 115.19,
-            "atr": 4.20,
-            "cash_available": 8000.0,
-            "shares_available": 0,
-            "open_lots": [{"open_lot_id": "lot1", "quantity": 10, "cost_basis": 110.00}],
-            "open_orders": [],
-        }
-        result = cloud_reconcile(runtime_state, ANCHOR, STEP, LOT_DOLLARS)
-
-        buys = [p for p in result["places"] if p["side"] == "buy"]
-        for buy in buys:
-            self.assertNotIn("tax_lots", buy, "Buy orders should never have tax_lots")
-
-    def test_tax_lots_deterministic_order(self):
-        """Tax lot assignment should be deterministic (sell price order)."""
-        runtime_state = {
-            "symbol": "HOOD",
-            "current_price": 115.19,
-            "atr": 4.20,
-            "cash_available": 0.0,
-            "shares_available": 50,
-            "open_lots": [
-                {"open_lot_id": "lot1", "quantity": 20, "cost_basis": 110.00},
-                {"open_lot_id": "lot2", "quantity": 20, "cost_basis": 112.00},
-            ],
-            "open_orders": [],
-        }
-
-        # Run twice; should get same assignment
-        result1 = cloud_reconcile(runtime_state, ANCHOR, STEP, LOT_DOLLARS)
-        result2 = cloud_reconcile(runtime_state, ANCHOR, STEP, LOT_DOLLARS)
-
-        places1 = normalize_places(result1["places"])
-        places2 = normalize_places(result2["places"])
-
-        # Should have identical tax_lots assignments
-        for p1, p2 in zip(places1, places2):
-            if p1["side"] == "sell" and "tax_lots" in p1:
-                self.assertEqual(p1.get("tax_lots"), p2.get("tax_lots"), "Tax lot assignment not deterministic")
-
-    def test_tax_lots_multiple_ascending_sells_no_double_assignment(self):
-        """Multiple ascending sells should use nearest gain lots without double-assigning."""
-        runtime_state = {
-            "symbol": "HOOD",
-            "current_price": 115.19,
-            "atr": 4.20,
-            "cash_available": 0.0,
-            "shares_available": 0,
-            "open_lots": [
-                {"open_lot_id": "lot_110", "quantity": 3, "cost_basis": 110.00},
-                {"open_lot_id": "lot_111", "quantity": 3, "cost_basis": 111.00},
-                {"open_lot_id": "lot_112", "quantity": 3, "cost_basis": 112.00},
-            ],
-            "open_orders": [],
-        }
-        result = cloud_reconcile(runtime_state, ANCHOR, STEP, lot_dollars_override=LOT_DOLLARS)
-
-        sells = [p for p in result["places"] if p["side"] == "sell"]
-
-        # Track total consumption across all sells
-        total_consumed = {}
-        for sell in sells:
-            if "tax_lots" in sell:
-                for tax_lot in sell["tax_lots"]:
-                    lot_id = tax_lot["open_lot_id"]
-                    qty = tax_lot["quantity"]
-                    total_consumed[lot_id] = total_consumed.get(lot_id, 0) + qty
-
-        # Each lot should not be over-consumed
-        for lot_id, total_qty in total_consumed.items():
-            # Find the original lot's quantity
-            for lot in runtime_state["open_lots"]:
-                if lot["open_lot_id"] == lot_id:
-                    self.assertLessEqual(total_qty, lot["quantity"],
-                        f"Lot {lot_id} consumed {total_qty} but only has {lot['quantity']}")
-                    break
-
-    def test_tax_lots_fifo_fallback_does_not_consume(self):
-        """FIFO-fallback sell should NOT mark lots as consumed (for following sells)."""
-        runtime_state = {
-            "symbol": "HOOD",
-            "current_price": 115.19,
-            "atr": 4.20,
-            "cash_available": 0.0,
-            "shares_available": 100,  # Plenty to sell
-            "open_lots": [
-                # Only 10 shares, but we'll generate sells that need more than can be assigned
-                {"open_lot_id": "lot1", "quantity": 10, "cost_basis": 110.00},
-            ],
-            "open_orders": [],
-        }
-        result = cloud_reconcile(runtime_state, ANCHOR, STEP, lot_dollars_override=LOT_DOLLARS)
-
-        # Count sells with and without tax_lots
-        sells = [p for p in result["places"] if p["side"] == "sell"]
-        sells_with_tax_lots = [s for s in sells if "tax_lots" in s]
-        sells_without_tax_lots = [s for s in sells if "tax_lots" not in s]
-
-        # If some sells fell back to FIFO, those should not have consumed lot1
-        # and subsequent sells should still be able to use lot1 if they need it
-        if len(sells_without_tax_lots) > 0 and len(sells_with_tax_lots) > 0:
-            # There are both FIFO-fallback and assigned sells
-            # This verifies the rollback logic worked (no double-consumption across fallback boundary)
-            pass  # Structure confirms rollback is working (no exception on over-consumption)
+        # With spot 111.00, all five exits (111.83–113.75) are above spot and must all be present
+        self.assertEqual(actual_exit_map, expected_exit_map,
+                        f"Expected exits {expected_exit_map}, got {actual_exit_map}")
 
 
 class TestDifferentialWithFixedLot(unittest.TestCase):
@@ -1120,8 +1015,8 @@ class TestChangeDefAndFV4Regression(unittest.TestCase):
         sell_places = [p for p in result["places"] if p["side"] == "sell"]
         self.assertEqual(len(sell_places), 0, "No sell places should be generated")
 
-    def test_4_selectable_mixed_tax_lots(self):
-        """Tax lots only assigned for is_selectable=True lots."""
+    def test_4_mixed_selectable_lots(self):
+        """Sells are placed for both selectable and non-selectable lots without tax_lots."""
         runtime_state = {
             "symbol": "HOOD", "current_price": 99.00, "atr": 1.0,
             "cash_available": 8000.0, "shares_available": 2, "cash_total": 8000.0,
@@ -1135,16 +1030,16 @@ class TestChangeDefAndFV4Regression(unittest.TestCase):
         # Exits at 100.48 (from 100.00) and 100.96 (from 100.48)
         sell_places = [p for p in result["places"] if p["side"] == "sell"]
         self.assertEqual(len(sell_places), 2)
-        # Find sell at 100.48 (should have tax_lots), and 100.96 (should not)
+        # Find sell at 100.48 and 100.96
         sell_100_48 = [p for p in sell_places if abs(p["limit_price"] - 100.48) < 0.01]
         sell_100_96 = [p for p in sell_places if abs(p["limit_price"] - 100.96) < 0.01]
         self.assertEqual(len(sell_100_48), 1, "Should have sell @100.48")
         self.assertEqual(len(sell_100_96), 1, "Should have sell @100.96")
-        # 100.48 exit is from 100.00 lot (selectable) - should have tax_lots
-        self.assertIn("tax_lots", sell_100_48[0], "Sell @100.48 should have tax_lots (from selectable lot)")
-        # 100.96 exit is from 100.48 lot (not selectable) - should NOT have tax_lots
-        self.assertNotIn("tax_lots", sell_100_96[0], "Sell @100.96 should not have tax_lots (non-selectable lot)")
-        self.assertGreaterEqual(result["diagnostics"].get("sell_fifo_fallback", 0), 1)
+        # Both exits should be placed as standard GTC limit orders without tax_lots
+        self.assertNotIn("tax_lots", sell_100_48[0], "Sell @100.48 should not have tax_lots")
+        self.assertNotIn("tax_lots", sell_100_96[0], "Sell @100.96 should not have tax_lots")
+        # sell_fifo_fallback should not be in diagnostics
+        self.assertNotIn("sell_fifo_fallback", result["diagnostics"], "sell_fifo_fallback should not be present")
 
     def test_5_sells_frozen_no_lots(self):
         """Shares held but no lots => sells are frozen, untouched."""
