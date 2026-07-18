@@ -7,7 +7,7 @@ Uses the exact live grid: ANCHOR=115.19, STEP=0.48, LOT_DOLLARS=115.62
 """
 
 import unittest
-from cloud_reconciler import reconcile as cloud_reconcile
+from cloud_reconciler import reconcile as cloud_reconcile, build_virtual_lots
 from grid_engine import plan_orders as engine_plan_orders
 
 
@@ -1251,6 +1251,353 @@ class TestMarketableExits(unittest.TestCase):
         self.assertAlmostEqual(sell_places[0]["limit_price"], 101.40, places=2)
         self.assertEqual(sell_places[0]["quantity"], 1)
         self.assertEqual(result["diagnostics"]["exits_marketable_below_spot"], 1)
+
+
+class TestVirtualLots(unittest.TestCase):
+    """CHANGE I (v7): Unit tests for build_virtual_lots."""
+
+    def test_buys_only(self):
+        """Buys only: virtual lots equal fills."""
+        step = 0.48
+        order_history = [
+            {"side": "buy", "price": 100.31, "quantity": 1, "filled_at": "2026-07-17T09:00:00Z"},
+            {"side": "buy", "price": 100.79, "quantity": 1, "filled_at": "2026-07-17T10:00:00Z"},
+        ]
+        virtual_lots, oversell_qty = build_virtual_lots(order_history, step)
+        self.assertEqual(len(virtual_lots), 2)
+        self.assertEqual(virtual_lots[0]["cost_basis"], 100.31)
+        self.assertEqual(virtual_lots[1]["cost_basis"], 100.79)
+        self.assertEqual(oversell_qty, 0)
+
+    def test_generating_match(self):
+        """Generating match: buy 1@100.31, sell 1@100.79 (100.31+0.48) -> lot consumed exactly."""
+        step = 0.48
+        order_history = [
+            {"side": "buy", "price": 100.31, "quantity": 1, "filled_at": "2026-07-17T09:00:00Z"},
+            {"side": "sell", "price": 100.79, "quantity": 1, "filled_at": "2026-07-17T10:00:00Z"},
+        ]
+        virtual_lots, oversell_qty = build_virtual_lots(order_history, step)
+        self.assertEqual(len(virtual_lots), 0, "Lot should be consumed exactly")
+        self.assertEqual(oversell_qty, 0)
+
+    def test_gain_fallback(self):
+        """Gain fallback: lots 99.00/100.00/101.00, sell 1@100.50 -> consumes 100.00 (highest below)."""
+        step = 0.48
+        order_history = [
+            {"side": "buy", "price": 99.00, "quantity": 1, "filled_at": "2026-07-17T09:00:00Z"},
+            {"side": "buy", "price": 100.00, "quantity": 1, "filled_at": "2026-07-17T09:30:00Z"},
+            {"side": "buy", "price": 101.00, "quantity": 1, "filled_at": "2026-07-17T10:00:00Z"},
+            {"side": "sell", "price": 100.50, "quantity": 1, "filled_at": "2026-07-17T10:30:00Z"},
+        ]
+        virtual_lots, oversell_qty = build_virtual_lots(order_history, step)
+        # Should have consumed 100.00 (highest cost_basis < 100.50), leaving 99.00 and 101.00
+        self.assertEqual(len(virtual_lots), 2)
+        costs = {lot["cost_basis"] for lot in virtual_lots}
+        self.assertIn(99.00, costs)
+        self.assertIn(101.00, costs)
+        self.assertNotIn(100.00, costs)
+        self.assertEqual(oversell_qty, 0)
+
+    def test_loss_defensive(self):
+        """Loss defensive: lots 111.00/112.00, sell 1@100.44 -> consumes 111.00 (lowest ≥ P)."""
+        step = 0.48
+        order_history = [
+            {"side": "buy", "price": 111.00, "quantity": 1, "filled_at": "2026-07-17T09:00:00Z"},
+            {"side": "buy", "price": 112.00, "quantity": 1, "filled_at": "2026-07-17T10:00:00Z"},
+            {"side": "sell", "price": 100.44, "quantity": 1, "filled_at": "2026-07-17T11:00:00Z"},
+        ]
+        virtual_lots, oversell_qty = build_virtual_lots(order_history, step)
+        # Should have consumed 111.00 (lowest cost_basis >= 100.44), leaving 112.00
+        self.assertEqual(len(virtual_lots), 1)
+        self.assertEqual(virtual_lots[0]["cost_basis"], 112.00)
+        self.assertEqual(oversell_qty, 0)
+
+    def test_partial_consumption(self):
+        """Partial consumption across lots."""
+        step = 0.48
+        order_history = [
+            {"side": "buy", "price": 100.00, "quantity": 2, "filled_at": "2026-07-17T09:00:00Z"},
+            {"side": "buy", "price": 101.00, "quantity": 2, "filled_at": "2026-07-17T10:00:00Z"},
+            {"side": "sell", "price": 100.48, "quantity": 3, "filled_at": "2026-07-17T11:00:00Z"},
+        ]
+        virtual_lots, oversell_qty = build_virtual_lots(order_history, step)
+        # Generating match: 100.00 + 0.48 = 100.48, should consume all 2 from first lot
+        # Then gain fallback: none (no 100.00 < 100.48 remaining)
+        # Then loss defensive: consume 1 from 101.00 lot (lowest >= 100.48)
+        self.assertEqual(len(virtual_lots), 1)
+        self.assertEqual(virtual_lots[0]["cost_basis"], 101.00)
+        self.assertEqual(virtual_lots[0]["quantity"], 1)
+        self.assertEqual(oversell_qty, 0)
+
+    def test_out_of_order_timestamps_get_sorted(self):
+        """Out-of-order timestamps get sorted before replay."""
+        step = 0.48
+        order_history = [
+            {"side": "buy", "price": 100.79, "quantity": 1, "filled_at": "2026-07-17T10:00:00Z"},
+            {"side": "buy", "price": 100.31, "quantity": 1, "filled_at": "2026-07-17T09:00:00Z"},
+            {"side": "sell", "price": 100.79, "quantity": 1, "filled_at": "2026-07-17T11:00:00Z"},
+        ]
+        virtual_lots, oversell_qty = build_virtual_lots(order_history, step)
+        # After sorting: 100.31 buy, then 100.79 buy, then 100.79 sell
+        # Sell at 100.79 should match 100.31 + 0.48 = 100.79, consuming the first lot
+        self.assertEqual(len(virtual_lots), 1)
+        self.assertEqual(virtual_lots[0]["cost_basis"], 100.79)
+        self.assertEqual(oversell_qty, 0)
+
+    def test_zero_qty_entries_skipped(self):
+        """Zero-qty entries are skipped."""
+        step = 0.48
+        order_history = [
+            {"side": "buy", "price": 100.31, "quantity": 1, "filled_at": "2026-07-17T09:00:00Z"},
+            {"side": "buy", "price": 100.79, "quantity": 0, "filled_at": "2026-07-17T10:00:00Z"},
+            {"side": "sell", "price": 100.79, "quantity": 1, "filled_at": "2026-07-17T11:00:00Z"},
+        ]
+        virtual_lots, oversell_qty = build_virtual_lots(order_history, step)
+        # 0-qty entry skipped; sell should consume the 100.31 lot
+        self.assertEqual(len(virtual_lots), 0)
+        self.assertEqual(oversell_qty, 0)
+
+    def test_oversell(self):
+        """Sells exceed buys -> oversell_qty correct, lots empty."""
+        step = 0.48
+        order_history = [
+            {"side": "buy", "price": 100.31, "quantity": 1, "filled_at": "2026-07-17T09:00:00Z"},
+            {"side": "sell", "price": 100.79, "quantity": 5, "filled_at": "2026-07-17T10:00:00Z"},
+        ]
+        virtual_lots, oversell_qty = build_virtual_lots(order_history, step)
+        # Sell 5 shares: 1 from the 100.31 lot (generating match), 4 oversell
+        self.assertEqual(len(virtual_lots), 0)
+        self.assertEqual(oversell_qty, 4)
+
+    def test_empty_history(self):
+        """Empty order history -> empty lots, 0 oversell."""
+        virtual_lots, oversell_qty = build_virtual_lots([], 0.48)
+        self.assertEqual(len(virtual_lots), 0)
+        self.assertEqual(oversell_qty, 0)
+
+
+class TestFullReplayRegression(unittest.TestCase):
+    """CHANGE I (v7): Full replay regression of real account history."""
+
+    def test_full_replay_real_account(self):
+        """
+        Replay the full real account history from the live incident.
+
+        Buys 2026-07-16: 1@111.35, 1@111.83, 1@112.31, 1@112.79, 1@113.27, 1@113.75, 1@114.23, 1@114.71;
+        Sells 2026-07-16: 3@112.86;
+        Buys 2026-07-17 morning: 1@100.3199, 1@100.31, 1@99.83, 1@99.35, 1@98.87, 1@98.39;
+        Sells 2026-07-17: 1@100.79, 1@100.80, 4@100.50, 4@100.4401, 1@100.79.
+
+        Assertions: never a negative lot; oversell_qty == 0; FINAL LEDGER EMPTY (position went to zero).
+        """
+        step = 0.48
+        order_history = [
+            # Buys 2026-07-16
+            {"side": "buy", "price": 111.35, "quantity": 1, "filled_at": "2026-07-16T09:30:00Z"},
+            {"side": "buy", "price": 111.83, "quantity": 1, "filled_at": "2026-07-16T09:45:00Z"},
+            {"side": "buy", "price": 112.31, "quantity": 1, "filled_at": "2026-07-16T10:00:00Z"},
+            {"side": "buy", "price": 112.79, "quantity": 1, "filled_at": "2026-07-16T10:15:00Z"},
+            {"side": "buy", "price": 113.27, "quantity": 1, "filled_at": "2026-07-16T10:30:00Z"},
+            {"side": "buy", "price": 113.75, "quantity": 1, "filled_at": "2026-07-16T10:45:00Z"},
+            {"side": "buy", "price": 114.23, "quantity": 1, "filled_at": "2026-07-16T11:00:00Z"},
+            {"side": "buy", "price": 114.71, "quantity": 1, "filled_at": "2026-07-16T11:15:00Z"},
+            # Sells 2026-07-16: 3@112.86 (consumes 112.79, 112.31, 111.83 via gain fallback)
+            {"side": "sell", "price": 112.86, "quantity": 3, "filled_at": "2026-07-16T15:00:00Z"},
+            # Buys 2026-07-17 morning
+            {"side": "buy", "price": 100.32, "quantity": 1, "filled_at": "2026-07-17T09:30:00Z"},  # Note: 100.3199 rounded to 100.32
+            {"side": "buy", "price": 100.31, "quantity": 1, "filled_at": "2026-07-17T09:45:00Z"},
+            {"side": "buy", "price": 99.83, "quantity": 1, "filled_at": "2026-07-17T10:00:00Z"},
+            {"side": "buy", "price": 99.35, "quantity": 1, "filled_at": "2026-07-17T10:15:00Z"},
+            {"side": "buy", "price": 98.87, "quantity": 1, "filled_at": "2026-07-17T10:30:00Z"},
+            {"side": "buy", "price": 98.39, "quantity": 1, "filled_at": "2026-07-17T10:45:00Z"},
+            # Sells 2026-07-17
+            {"side": "sell", "price": 100.79, "quantity": 1, "filled_at": "2026-07-17T11:00:00Z"},  # Consumes 100.31 (generating)
+            {"side": "sell", "price": 100.80, "quantity": 1, "filled_at": "2026-07-17T11:15:00Z"},  # Consumes 100.32 (generating)
+            {"side": "sell", "price": 100.50, "quantity": 4, "filled_at": "2026-07-17T11:30:00Z"},  # Consumes 99.83, 99.35, 98.87, 98.39 (loss defensive)
+            {"side": "sell", "price": 100.44, "quantity": 4, "filled_at": "2026-07-17T11:45:00Z"},  # Consumes remaining
+            {"side": "sell", "price": 100.79, "quantity": 1, "filled_at": "2026-07-17T12:00:00Z"},  # Consumes final
+        ]
+
+        virtual_lots, oversell_qty = build_virtual_lots(order_history, step)
+
+        # Final ledger should be empty
+        self.assertEqual(len(virtual_lots), 0, "Final ledger should be empty (position liquidated)")
+        self.assertEqual(oversell_qty, 0, "No oversell should occur")
+
+    def test_full_replay_intermediate_state(self):
+        """
+        Intermediate state right after the 4@100.50 sell in the real account.
+
+        Remaining virtual lots should be exactly {111.35, 113.27, 113.75, 114.23, 114.71}.
+        """
+        step = 0.48
+        order_history = [
+            # Buys 2026-07-16
+            {"side": "buy", "price": 111.35, "quantity": 1, "filled_at": "2026-07-16T09:30:00Z"},
+            {"side": "buy", "price": 111.83, "quantity": 1, "filled_at": "2026-07-16T09:45:00Z"},
+            {"side": "buy", "price": 112.31, "quantity": 1, "filled_at": "2026-07-16T10:00:00Z"},
+            {"side": "buy", "price": 112.79, "quantity": 1, "filled_at": "2026-07-16T10:15:00Z"},
+            {"side": "buy", "price": 113.27, "quantity": 1, "filled_at": "2026-07-16T10:30:00Z"},
+            {"side": "buy", "price": 113.75, "quantity": 1, "filled_at": "2026-07-16T10:45:00Z"},
+            {"side": "buy", "price": 114.23, "quantity": 1, "filled_at": "2026-07-16T11:00:00Z"},
+            {"side": "buy", "price": 114.71, "quantity": 1, "filled_at": "2026-07-16T11:15:00Z"},
+            # Sells 2026-07-16
+            {"side": "sell", "price": 112.86, "quantity": 3, "filled_at": "2026-07-16T15:00:00Z"},
+            # Buys 2026-07-17 morning
+            {"side": "buy", "price": 100.32, "quantity": 1, "filled_at": "2026-07-17T09:30:00Z"},
+            {"side": "buy", "price": 100.31, "quantity": 1, "filled_at": "2026-07-17T09:45:00Z"},
+            {"side": "buy", "price": 99.83, "quantity": 1, "filled_at": "2026-07-17T10:00:00Z"},
+            {"side": "buy", "price": 99.35, "quantity": 1, "filled_at": "2026-07-17T10:15:00Z"},
+            {"side": "buy", "price": 98.87, "quantity": 1, "filled_at": "2026-07-17T10:30:00Z"},
+            {"side": "buy", "price": 98.39, "quantity": 1, "filled_at": "2026-07-17T10:45:00Z"},
+            # First two sells 2026-07-17 (100.79 and 100.80)
+            {"side": "sell", "price": 100.79, "quantity": 1, "filled_at": "2026-07-17T11:00:00Z"},
+            {"side": "sell", "price": 100.80, "quantity": 1, "filled_at": "2026-07-17T11:15:00Z"},
+            # The 4@100.50 sell
+            {"side": "sell", "price": 100.50, "quantity": 4, "filled_at": "2026-07-17T11:30:00Z"},
+        ]
+
+        virtual_lots, oversell_qty = build_virtual_lots(order_history, step)
+
+        # Expected remaining: {111.35, 113.27, 113.75, 114.23, 114.71}
+        self.assertEqual(len(virtual_lots), 5)
+        remaining_costs = sorted([lot["cost_basis"] for lot in virtual_lots])
+        expected_costs = [111.35, 113.27, 113.75, 114.23, 114.71]
+        self.assertEqual(remaining_costs, expected_costs,
+                        f"Expected costs {expected_costs}, got {remaining_costs}")
+        self.assertEqual(oversell_qty, 0)
+
+
+class TestCascadePreventionScenario(unittest.TestCase):
+    """CHANGE I (v7): Cascade prevention scenario (the bug that motivated v7)."""
+
+    def test_cascade_prevention_with_virtual_lots(self):
+        """
+        State after 4@100.50 sell in the real account, with the three standing GTC sells
+        s1/s2/s3 at 111.83/112.31/112.79.
+
+        With virtual lots {111.35, 113.27, 113.75, 114.23, 114.71}:
+        - Desired exits: cost_basis + 0.48 = {111.83, 113.75, 114.23, 114.71, 115.19}
+        - s1 (111.83) KEPT (matches 111.35 + 0.48)
+        - s2/s3 (112.31 / 112.79) CANCELLED (no matching virtual exits)
+        - NO marketable sell (all exits > spot 100.31)
+        - NO SELL AT OR BELOW SPOT (critical: the bug was selling at/below spot)
+        """
+        step = 0.48
+        # Build virtual lots from the history
+        order_history = [
+            {"side": "buy", "price": 111.35, "quantity": 1, "filled_at": "2026-07-16T09:30:00Z"},
+            {"side": "buy", "price": 111.83, "quantity": 1, "filled_at": "2026-07-16T09:45:00Z"},
+            {"side": "buy", "price": 112.31, "quantity": 1, "filled_at": "2026-07-16T10:00:00Z"},
+            {"side": "buy", "price": 112.79, "quantity": 1, "filled_at": "2026-07-16T10:15:00Z"},
+            {"side": "buy", "price": 113.27, "quantity": 1, "filled_at": "2026-07-16T10:30:00Z"},
+            {"side": "buy", "price": 113.75, "quantity": 1, "filled_at": "2026-07-16T10:45:00Z"},
+            {"side": "buy", "price": 114.23, "quantity": 1, "filled_at": "2026-07-16T11:00:00Z"},
+            {"side": "buy", "price": 114.71, "quantity": 1, "filled_at": "2026-07-16T11:15:00Z"},
+            {"side": "sell", "price": 112.86, "quantity": 3, "filled_at": "2026-07-16T15:00:00Z"},
+            {"side": "buy", "price": 100.32, "quantity": 1, "filled_at": "2026-07-17T09:30:00Z"},
+            {"side": "buy", "price": 100.31, "quantity": 1, "filled_at": "2026-07-17T09:45:00Z"},
+            {"side": "buy", "price": 99.83, "quantity": 1, "filled_at": "2026-07-17T10:00:00Z"},
+            {"side": "buy", "price": 99.35, "quantity": 1, "filled_at": "2026-07-17T10:15:00Z"},
+            {"side": "buy", "price": 98.87, "quantity": 1, "filled_at": "2026-07-17T10:30:00Z"},
+            {"side": "buy", "price": 98.39, "quantity": 1, "filled_at": "2026-07-17T10:45:00Z"},
+            {"side": "sell", "price": 100.79, "quantity": 1, "filled_at": "2026-07-17T11:00:00Z"},
+            {"side": "sell", "price": 100.80, "quantity": 1, "filled_at": "2026-07-17T11:15:00Z"},
+            {"side": "sell", "price": 100.50, "quantity": 4, "filled_at": "2026-07-17T11:30:00Z"},
+        ]
+
+        runtime_state = {
+            "symbol": "HOOD",
+            "current_price": 100.31,
+            "cash_available": 415.0,
+            "shares_available": 2,  # From virtual lots
+            "average_cost": 103.62,
+            "cash_total": 430.0,
+            "order_history": order_history,
+            "open_orders": [
+                {"order_id": "s1", "side": "sell", "limit_price": 111.83, "quantity": 1},
+                {"order_id": "s2", "side": "sell", "limit_price": 112.31, "quantity": 1},
+                {"order_id": "s3", "side": "sell", "limit_price": 112.79, "quantity": 1},
+            ],
+        }
+
+        result = cloud_reconcile(runtime_state, anchor=115.19, step=step)
+
+        # Invariants that MUST hold:
+        # 1. No sell at or below spot 100.31
+        for place in result["places"]:
+            if place["side"] == "sell":
+                self.assertGreater(place["limit_price"], 100.31,
+                                 f"ERROR: Sell at {place['limit_price']} <= spot {100.31} (cascade bug!)")
+
+        # 2. ledger_mismatch should be 0 (virtual total = shares available)
+        self.assertEqual(result["diagnostics"]["ledger_mismatch"], 0,
+                        "Ledger mismatch should be 0 in healthy state")
+
+        # 3. Virtual lots should match expected
+        virtual_lots_expected = [[111.35, 1], [113.27, 1], [113.75, 1], [114.23, 1], [114.71, 1]]
+        self.assertEqual(result["diagnostics"]["virtual_lots"], virtual_lots_expected,
+                        f"Virtual lots mismatch")
+
+        # 4. exits_marketable_below_spot should be 0 (all exits > spot)
+        self.assertEqual(result["diagnostics"]["exits_marketable_below_spot"], 0,
+                        "No marketable sell should be placed (all exits > spot)")
+
+    def test_ledger_mismatch_gate_freezes_sells(self):
+        """Ledger mismatch gate: virtual total != shares, sells frozen."""
+        step = 0.48
+        order_history = [
+            {"side": "buy", "price": 111.35, "quantity": 1, "filled_at": "2026-07-16T09:30:00Z"},
+            {"side": "buy", "price": 111.83, "quantity": 1, "filled_at": "2026-07-16T09:45:00Z"},
+        ]
+
+        runtime_state = {
+            "symbol": "HOOD",
+            "current_price": 112.00,
+            "cash_available": 1000.0,
+            "shares_available": 5,  # Mismatch: virtual total is 2, but shares_available is 5
+            "order_history": order_history,
+            "open_orders": [
+                {"order_id": "s1", "side": "sell", "limit_price": 111.83, "quantity": 1},
+            ],
+        }
+
+        result = cloud_reconcile(runtime_state, anchor=115.19, step=step)
+
+        # Sells should be frozen (existing order kept, no new sells placed)
+        self.assertNotIn("s1", result["cancels"], "Existing sell should be kept when ledger mismatches")
+        sell_places = [p for p in result["places"] if p["side"] == "sell"]
+        self.assertEqual(len(sell_places), 0, "No new sells should be placed when ledger mismatches")
+        self.assertNotEqual(result["diagnostics"]["ledger_mismatch"], 0,
+                           "ledger_mismatch should be non-zero")
+
+
+class TestLegacyFallback(unittest.TestCase):
+    """CHANGE I (v7): Legacy fallback when order_history is absent."""
+
+    def test_legacy_fallback_no_order_history(self):
+        """Absent order_history -> legacy path with open_lots works as v6."""
+        runtime_state = {
+            "symbol": "HOOD",
+            "current_price": 111.00,  # Below the exit price so it's placed as a normal exit
+            "cash_available": 1000.0,
+            "shares_available": 1,
+            "open_orders": [],
+            "open_lots": [{"open_lot_id": "lot1", "quantity": 1, "cost_basis": 111.35}],
+            # NO order_history - should use legacy path
+        }
+
+        result = cloud_reconcile(runtime_state, anchor=115.19, step=0.48, lot_dollars_override=115.62)
+
+        # Should have computed the desired exit at 111.83 (111.35 + 0.48)
+        sells = [p for p in result["places"] if p["side"] == "sell"]
+        sell_prices = {round(s["limit_price"], 2) for s in sells}
+        self.assertIn(111.83, sell_prices, "Should place sell at cost + step")
+
+        # Diagnostics should still have the new fields (all initialized to default)
+        self.assertIn("ledger_mismatch", result["diagnostics"])
+        self.assertIn("virtual_lots", result["diagnostics"])
+        self.assertIn("oversell_qty", result["diagnostics"])
 
 
 if __name__ == "__main__":

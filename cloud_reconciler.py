@@ -9,6 +9,7 @@ Enhancements:
 - CHANGE A: Dynamic lot sizing from equity (cost-basis + cash)
 - CHANGE G (v5): Sells are standard limit orders — tax-lot designation removed (designated orders could be rejected for unselectable lots, leaving no standing sell)
 - CHANGE H (v6): exits overtaken by price (exit <= spot) are not deferred; they merge into one marketable limit sell at spot - 0.10 so the shares exit immediately
+- CHANGE I (v7): virtual lot ledger — lots are replayed deterministically from filled-order history (build_virtual_lots); broker tax lots / FIFO are ignored by the engine
 
 Use: python3 cloud_reconciler.py --state-file runtime.json [--out plan.json] [--anchor A --step S --lot L]
 """
@@ -29,6 +30,99 @@ TIME_IN_FORCE = "gtc"
 MARKET_HOURS = "regular_hours"
 BUFFER_LOTS = 2  # CHANGE D: number of lots to hold in buffer
 MARKETABLE_EXIT_DISCOUNT = 0.10  # CHANGE H: discount below spot for marketable exits; MUST stay < STEP (guarantees marketable exits never sell below a lot's cost: exit <= spot implies cost + step <= spot, so spot - discount >= cost + step - discount > cost)
+
+
+def build_virtual_lots(order_history, step):
+    """
+    CHANGE I (v7): Replay order history deterministically to build virtual lot ledger.
+
+    Broker FIFO is ignored; the engine tracks its own lots from filled orders.
+
+    Args:
+        order_history: list of {side: "buy"|"sell", price: float (average fill price),
+                               quantity: number (cumulative filled qty), filled_at: str (ISO timestamp)}.
+                       Entries with quantity <= 0 are skipped.
+        step: grid step for determining generating lots (cost_basis + step = exit price)
+
+    Returns:
+        (virtual_lots, oversell_qty)
+        - virtual_lots: list of {cost_basis, quantity} (in chronological order of acquisition)
+        - oversell_qty: total shares sold that couldn't be matched to any lot (0 if healthy)
+    """
+    if not order_history:
+        return [], 0
+
+    # Sort by filled_at (ISO-8601 UTC; string sort is stable for ties)
+    sorted_history = sorted(order_history, key=lambda x: x.get("filled_at", ""))
+
+    virtual_lots = []  # List of {cost_basis, quantity}
+    oversell_qty = 0
+
+    for order in sorted_history:
+        if order.get("quantity", 0) <= 0:
+            continue  # Skip zero/negative qty entries
+
+        side = order.get("side")
+        price = round(order.get("price", 0), 2)
+        qty = order.get("quantity", 0)
+
+        if side == "buy":
+            # Add a new lot
+            virtual_lots.append({"cost_basis": price, "quantity": int(qty)})
+
+        elif side == "sell":
+            # Consume shares using priority: generating, gain fallback, loss defensive
+            remaining_sell_qty = int(qty)
+
+            # Priority 1: GENERATING lots (cost_basis where cost_basis + step == price)
+            for lot in virtual_lots[:]:  # Iterate on copy to allow removal
+                if remaining_sell_qty <= 0:
+                    break
+                cost_basis = lot["cost_basis"]
+                exit_price = round(cost_basis + step, 2)
+
+                if abs(exit_price - price) < 1e-9:  # Floating point safe comparison
+                    consumed = min(remaining_sell_qty, lot["quantity"])
+                    lot["quantity"] -= consumed
+                    remaining_sell_qty -= consumed
+                    if lot["quantity"] <= 0:
+                        virtual_lots.remove(lot)
+
+            # Priority 2: GAIN fallback (cost_basis < price, highest cost first = smallest gain)
+            if remaining_sell_qty > 0:
+                # Sort by cost_basis descending (highest first, to minimize gain)
+                lots_with_gain = [l for l in virtual_lots if l["cost_basis"] < price]
+                lots_with_gain.sort(key=lambda l: l["cost_basis"], reverse=True)
+
+                for lot in lots_with_gain:
+                    if remaining_sell_qty <= 0:
+                        break
+                    consumed = min(remaining_sell_qty, lot["quantity"])
+                    lot["quantity"] -= consumed
+                    remaining_sell_qty -= consumed
+                    if lot["quantity"] <= 0:
+                        virtual_lots.remove(lot)
+
+            # Priority 3: LOSS defensive (cost_basis >= price, lowest cost first = smallest loss)
+            if remaining_sell_qty > 0:
+                # Sort by cost_basis ascending (lowest first, to minimize loss)
+                lots_with_loss = [l for l in virtual_lots if l["cost_basis"] >= price]
+                lots_with_loss.sort(key=lambda l: l["cost_basis"])
+
+                for lot in lots_with_loss:
+                    if remaining_sell_qty <= 0:
+                        break
+                    consumed = min(remaining_sell_qty, lot["quantity"])
+                    lot["quantity"] -= consumed
+                    remaining_sell_qty -= consumed
+                    if lot["quantity"] <= 0:
+                        virtual_lots.remove(lot)
+
+            # Any remaining is oversold
+            if remaining_sell_qty > 0:
+                oversell_qty += remaining_sell_qty
+
+    return virtual_lots, int(oversell_qty)
 
 
 def floor(x):
@@ -120,9 +214,9 @@ def compute_dynamic_lot(runtime_state, num_levels=NUM_LEVELS, buffer_lots=BUFFER
 
 def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels=NUM_LEVELS, buffer_lots=BUFFER_LOTS, tick=TICK):
     """
-    Core reconciliation logic (v6 with CHANGE D/E/F/G/H).
+    Core reconciliation logic (v7 with CHANGE D/E/F/G/H/I).
 
-    Input: {symbol, current_price, cash_available, shares_available, open_orders, average_cost?, open_lots?, cash_total?}
+    Input: {symbol, current_price, cash_available, shares_available, open_orders, average_cost?, order_history?, open_lots?, cash_total?}
     Output: {cancels, places, diagnostics}
 
     Args:
@@ -133,6 +227,7 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
     cash_available = runtime_state["cash_available"]
     shares_available = runtime_state["shares_available"]
     open_orders = runtime_state.get("open_orders", [])
+    order_history = runtime_state.get("order_history")  # CHANGE I: prefer order_history
     open_lots = runtime_state.get("open_lots", [])
 
     # CHANGE D: Compute or use fixed lot_dollars (with buffer_lots)
@@ -146,6 +241,16 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
         lot_dollars, equity_at_cost, total_shares, avg_cost_used, unsettled = compute_dynamic_lot(
             runtime_state, num_levels, buffer_lots
         )
+
+    # CHANGE I: Build virtual lots from order_history if available
+    virtual_lots = []
+    oversell_qty = 0
+    ledger_mismatch = 0
+
+    if order_history is not None:
+        virtual_lots, oversell_qty = build_virtual_lots(order_history, step)
+        open_lots = virtual_lots  # Use virtual lots, ignore broker lots
+    # Else: legacy fallback, use open_lots as-is
 
     # CHANGE F: Generate buy_lines using sliding lattice (not fixed band)
     if step <= 0:
@@ -169,6 +274,9 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
                 "marketable_exit_price": None,
                 "sells_frozen_no_lots": False,
                 "buys_suppressed_level_guard": 0,
+                "ledger_mismatch": ledger_mismatch,
+                "virtual_lots": [],
+                "oversell_qty": oversell_qty,
             },
         }
 
@@ -178,13 +286,26 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
         i_max -= 1
     buy_lines = [round(anchor + i * step, 2) for i in range(i_max, i_max - num_levels, -1)]
 
-    # CHANGE E: FAIL-SAFE check: sells_frozen_no_lots
-    # If shares are held but no lots data, don't touch sells (keep them as-is)
-    sells_frozen = False
+    # CHANGE I: LEDGER SANITY GATE - verify virtual ledger matches expected shares
     open_sell_qty = sum(o["quantity"] for o in open_orders if o["side"] == "sell")
-    if (shares_available + open_sell_qty > 0) and not open_lots:
-        # CHANGE E: FAIL-SAFE - sells_frozen_no_lots
-        sells_frozen = True
+    total_shares = shares_available + open_sell_qty
+
+    if order_history is not None:
+        # Virtual ledger mode: check ledger consistency
+        virtual_total = sum(lot["quantity"] for lot in virtual_lots)
+        ledger_mismatch = virtual_total - total_shares
+
+        if ledger_mismatch != 0 or oversell_qty > 0:
+            # Ledger mismatch: freeze sells, allow buys
+            sells_frozen = True
+        else:
+            sells_frozen = False
+    else:
+        # Legacy mode: use existing sells_frozen logic
+        sells_frozen = False
+        if (shares_available + open_sell_qty > 0) and not open_lots:
+            # CHANGE E: FAIL-SAFE - sells_frozen_no_lots
+            sells_frozen = True
 
     # CHANGE E: Compute desired exits from open_lots
     desired_exits = {}  # {exit_price: qty}
@@ -368,6 +489,16 @@ def reconcile(runtime_state, anchor, step, lot_dollars_override=None, num_levels
     # Add CHANGE C level-guard suppression count
     if open_lots:
         diag["buys_suppressed_level_guard"] = len(suppressed_lines)
+
+    # CHANGE I: Add virtual lot ledger diagnostics
+    diag["ledger_mismatch"] = ledger_mismatch
+    diag["oversell_qty"] = oversell_qty
+    # Compact list of [cost_basis, quantity] pairs, sorted by cost ascending
+    virtual_lots_compact = sorted(
+        [[lot["cost_basis"], lot["quantity"]] for lot in virtual_lots],
+        key=lambda x: x[0]
+    )
+    diag["virtual_lots"] = virtual_lots_compact
 
     return {
         "cancels": [o["order_id"] for o in cancelled_orders],

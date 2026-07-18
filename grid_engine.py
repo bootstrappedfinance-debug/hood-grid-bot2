@@ -14,6 +14,9 @@ Module-level config (defaults; can be overridden via config parameter):
   TICK = 0.01
   TIME_IN_FORCE = "gtc"
   MARKET_HOURS = "regular_hours"
+
+Enhancements:
+  CHANGE I (v7): virtual lot ledger — lots are replayed deterministically from filled-order history (build_virtual_lots); broker tax lots / FIFO are ignored by the engine
 """
 
 import sys
@@ -22,6 +25,99 @@ import math
 import argparse
 from pathlib import Path
 from typing import Optional, Dict, Any, List
+
+
+def build_virtual_lots(order_history: List[Dict[str, Any]], step: float) -> tuple:
+    """
+    CHANGE I (v7): Replay order history deterministically to build virtual lot ledger.
+
+    Broker FIFO is ignored; the engine tracks its own lots from filled orders.
+
+    Args:
+        order_history: list of {side: "buy"|"sell", price: float (average fill price),
+                               quantity: number (cumulative filled qty), filled_at: str (ISO timestamp)}.
+                       Entries with quantity <= 0 are skipped.
+        step: grid step for determining generating lots (cost_basis + step = exit price)
+
+    Returns:
+        (virtual_lots, oversell_qty)
+        - virtual_lots: list of {cost_basis, quantity} (in chronological order of acquisition)
+        - oversell_qty: total shares sold that couldn't be matched to any lot (0 if healthy)
+    """
+    if not order_history:
+        return [], 0
+
+    # Sort by filled_at (ISO-8601 UTC; string sort is stable for ties)
+    sorted_history = sorted(order_history, key=lambda x: x.get("filled_at", ""))
+
+    virtual_lots = []  # List of {cost_basis, quantity}
+    oversell_qty = 0
+
+    for order in sorted_history:
+        if order.get("quantity", 0) <= 0:
+            continue  # Skip zero/negative qty entries
+
+        side = order.get("side")
+        price = round(order.get("price", 0), 2)
+        qty = order.get("quantity", 0)
+
+        if side == "buy":
+            # Add a new lot
+            virtual_lots.append({"cost_basis": price, "quantity": int(qty)})
+
+        elif side == "sell":
+            # Consume shares using priority: generating, gain fallback, loss defensive
+            remaining_sell_qty = int(qty)
+
+            # Priority 1: GENERATING lots (cost_basis where cost_basis + step == price)
+            for lot in virtual_lots[:]:  # Iterate on copy to allow removal
+                if remaining_sell_qty <= 0:
+                    break
+                cost_basis = lot["cost_basis"]
+                exit_price = round(cost_basis + step, 2)
+
+                if abs(exit_price - price) < 1e-9:  # Floating point safe comparison
+                    consumed = min(remaining_sell_qty, lot["quantity"])
+                    lot["quantity"] -= consumed
+                    remaining_sell_qty -= consumed
+                    if lot["quantity"] <= 0:
+                        virtual_lots.remove(lot)
+
+            # Priority 2: GAIN fallback (cost_basis < price, highest cost first = smallest gain)
+            if remaining_sell_qty > 0:
+                # Sort by cost_basis descending (highest first, to minimize gain)
+                lots_with_gain = [l for l in virtual_lots if l["cost_basis"] < price]
+                lots_with_gain.sort(key=lambda l: l["cost_basis"], reverse=True)
+
+                for lot in lots_with_gain:
+                    if remaining_sell_qty <= 0:
+                        break
+                    consumed = min(remaining_sell_qty, lot["quantity"])
+                    lot["quantity"] -= consumed
+                    remaining_sell_qty -= consumed
+                    if lot["quantity"] <= 0:
+                        virtual_lots.remove(lot)
+
+            # Priority 3: LOSS defensive (cost_basis >= price, lowest cost first = smallest loss)
+            if remaining_sell_qty > 0:
+                # Sort by cost_basis ascending (lowest first, to minimize loss)
+                lots_with_loss = [l for l in virtual_lots if l["cost_basis"] >= price]
+                lots_with_loss.sort(key=lambda l: l["cost_basis"])
+
+                for lot in lots_with_loss:
+                    if remaining_sell_qty <= 0:
+                        break
+                    consumed = min(remaining_sell_qty, lot["quantity"])
+                    lot["quantity"] -= consumed
+                    remaining_sell_qty -= consumed
+                    if lot["quantity"] <= 0:
+                        virtual_lots.remove(lot)
+
+            # Any remaining is oversold
+            if remaining_sell_qty > 0:
+                oversell_qty += remaining_sell_qty
+
+    return virtual_lots, int(oversell_qty)
 
 
 # Module-level config (can be loaded from config.json, but these are defaults)
@@ -220,12 +316,12 @@ def plan_orders(
     config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Core planning algorithm (v4 with CHANGE D/E/F/H).
+    Core planning algorithm (v4 with CHANGE D/E/F/H/I).
 
     Analyzes current account state and grid, returns a plan of order cancels and places.
 
     Input runtime_state:
-      symbol, current_price, atr, cash_available, shares_available, open_orders, open_lots, cash_total (optional)
+      symbol, current_price, atr, cash_available, shares_available, open_orders, order_history (optional, CHANGE I), open_lots, cash_total (optional)
 
     Input grid_state:
       anchor, step, initialized (or empty {} on first run)
@@ -238,7 +334,8 @@ def plan_orders(
                     cash_budget_used, shares_budget_used, initialized_now, skipped_no_cash,
                     unsettled_cash, buffer_lots, buffer_dollars, lot_below_min_line,
                     exits_marketable_below_spot, marketable_exit_price, sells_frozen_no_lots, reanchored (always False),
-                    not_initialized, buys_suppressed_level_guard}
+                    not_initialized, buys_suppressed_level_guard, ledger_mismatch (CHANGE I),
+                    virtual_lots (CHANGE I), oversell_qty (CHANGE I)}
     """
     cfg = _get_config(config)
     num_levels = cfg.get("NUM_LEVELS", NUM_LEVELS)
@@ -253,6 +350,7 @@ def plan_orders(
     cash_available = runtime_state["cash_available"]
     shares_available = runtime_state["shares_available"]
     open_orders = runtime_state.get("open_orders", [])
+    order_history = runtime_state.get("order_history")  # CHANGE I: prefer order_history
     open_lots = runtime_state.get("open_lots", [])  # CHANGE E: for exits
 
     # Copy grid_state so we can mutate it
@@ -291,6 +389,9 @@ def plan_orders(
                     "skipped_no_cash": False,
                     "not_initialized": True,
                     "buys_suppressed_level_guard": 0,
+                    "ledger_mismatch": 0,
+                    "virtual_lots": [],
+                    "oversell_qty": 0,
                 },
             }
     else:
@@ -323,6 +424,9 @@ def plan_orders(
                         "skipped_no_cash": True,
                         "not_initialized": False,
                         "buys_suppressed_level_guard": 0,
+                        "ledger_mismatch": 0,
+                        "virtual_lots": [],
+                        "oversell_qty": 0,
                     },
                 }
             gs = initialize_grid(current_price, atr, cash_available, config)
@@ -333,9 +437,20 @@ def plan_orders(
     lot_dollars, unsettled_cash = compute_dynamic_lot(runtime_state, num_levels, buffer_lots)
     gs["lot_dollars"] = lot_dollars  # Store for diagnostics
 
-    # Step 3: CHANGE F - Generate buy_lines using sliding lattice
+    # CHANGE I: Build virtual lots from order_history after step is available
+    virtual_lots = []
+    oversell_qty = 0
+    ledger_mismatch = 0
+
     anchor = gs.get("anchor", 0.0)
     step = gs.get("step", 0.0)
+
+    if order_history is not None:
+        virtual_lots, oversell_qty = build_virtual_lots(order_history, step)
+        open_lots = virtual_lots  # Use virtual lots, ignore broker lots
+    # Else: legacy fallback, use open_lots as-is
+
+    # Step 3: CHANGE F - Generate buy_lines using sliding lattice
     if step <= 0:
         return {
             "cancels": [],
@@ -362,6 +477,9 @@ def plan_orders(
                 "skipped_no_cash": skipped_no_cash,
                 "not_initialized": not_initialized,
                 "buys_suppressed_level_guard": 0,
+                "ledger_mismatch": ledger_mismatch,
+                "virtual_lots": [],
+                "oversell_qty": oversell_qty,
             },
         }
 
@@ -374,13 +492,27 @@ def plan_orders(
     else:
         buy_lines = []
 
-    # Step 4: CHANGE E - FAIL-SAFE check: sells_frozen_no_lots
+    # Step 4: CHANGE I - LEDGER SANITY GATE & CHANGE E - FAIL-SAFE check
     # If shares are held but no lots data, don't touch sells (keep them as-is)
     sells_frozen = False
     open_sell_qty = sum(o["quantity"] for o in open_orders if o["side"] == "sell")
-    if (shares_available + open_sell_qty > 0) and not open_lots:
-        # CHANGE E: FAIL-SAFE - sells_frozen_no_lots
-        sells_frozen = True
+    total_shares = shares_available + open_sell_qty
+
+    if order_history is not None:
+        # Virtual ledger mode: check ledger consistency
+        virtual_total = sum(lot["quantity"] for lot in virtual_lots)
+        ledger_mismatch = virtual_total - total_shares
+
+        if ledger_mismatch != 0 or oversell_qty > 0:
+            # Ledger mismatch: freeze sells, allow buys
+            sells_frozen = True
+        else:
+            sells_frozen = False
+    else:
+        # Legacy mode: use existing sells_frozen logic
+        if (shares_available + open_sell_qty > 0) and not open_lots:
+            # CHANGE E: FAIL-SAFE - sells_frozen_no_lots
+            sells_frozen = True
 
     # Step 5: Compute desired exits from open_lots
     desired_exits = {}  # {exit_price: qty}
@@ -539,6 +671,12 @@ def plan_orders(
     # Step 10: Return full plan
     cancels = [o["order_id"] for o in cancelled_orders]
 
+    # CHANGE I: Compact list of [cost_basis, quantity] pairs, sorted by cost ascending
+    virtual_lots_compact = sorted(
+        [[lot["cost_basis"], lot["quantity"]] for lot in virtual_lots],
+        key=lambda x: x[0]
+    )
+
     return {
         "cancels": cancels,
         "places": places,
@@ -564,6 +702,9 @@ def plan_orders(
             "skipped_no_cash": skipped_no_cash,
             "not_initialized": not_initialized,
             "buys_suppressed_level_guard": len(suppressed_lines),
+            "ledger_mismatch": ledger_mismatch,  # CHANGE I
+            "virtual_lots": virtual_lots_compact,  # CHANGE I
+            "oversell_qty": oversell_qty,  # CHANGE I
         },
     }
 
